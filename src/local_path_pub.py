@@ -7,6 +7,7 @@ import math
 import numpy as np
 from math import pi, hypot
 from scipy.interpolate import CubicSpline
+from scipy.ndimage import gaussian_filter1d
 
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PoseStamped
@@ -42,7 +43,7 @@ class GlobalPathAnalyzer:
         self.prev_s = None
 
         # 디버그 및 로컬 경로 발행
-        self.debug_pub = rospy.Publisher('/debug_s0_q0', Float32MultiArray, queue_size=1)
+        # self.debug_pub = rospy.Publisher('/debug_s0_q0', Float32MultiArray, queue_size=1)
         # 커스텀 메시지 CandidatePaths 퍼블리셔
         self.candidate_path_pub = rospy.Publisher('/candidate_paths', CandidatePaths, queue_size=1)
         self.candidate_path_pub1 = rospy.Publisher('/candidate_path1', Path, queue_size=1)
@@ -84,6 +85,9 @@ class GlobalPathAnalyzer:
                 candidate_paths_msg = CandidatePaths()
                 candidate_paths_msg.paths = candidate_paths_list
 
+                # 최적 경로 선택
+                optimal_path = self.compute_optimal_path(candidate_paths_msg.paths)
+
                 # 퍼블리시 (한 번에 모든 후보 경로 전달)
                 self.candidate_path_pub.publish(candidate_paths_msg)
                 self.candidate_path_pub1.publish(candidate_paths_msg.paths[0])
@@ -108,9 +112,9 @@ class GlobalPathAnalyzer:
                               s0, x_s0, y_s0, q0)
                 rospy.loginfo("장애물 좌표 업데이트: %s", self.obstacles_s)
 
-                debug_msg = Float32MultiArray()
-                debug_msg.data = [s0, q0]
-                self.debug_pub.publish(debug_msg)
+                # debug_msg = Float32MultiArray()
+                # debug_msg.data = [s0, q0]
+                # self.debug_pub.publish(debug_msg)
 
                 self.is_odom_received = False
                 # self.is_global_path_ready = False
@@ -381,12 +385,12 @@ class GlobalPathAnalyzer:
             s_val = (s0 + t) % self.total_length
             # print("s_val = %.3f, q_val = %.3f",s_val,q_val)
             # 4-3) Frenet -> Cartesian 변환
-            X, Y = self.frenet_to_cartesian(s_val, q_val)
+            # X, Y = self.frenet_to_cartesian(s_val, q_val)
 
             pose = PoseStamped()
             pose.header.frame_id = "map"
-            pose.pose.position.x = X
-            pose.pose.position.y = Y
+            pose.pose.position.x = s_val
+            pose.pose.position.y = q_val
             pose.pose.orientation.w = 1.0
             path_msg.poses.append(pose)
 
@@ -456,6 +460,35 @@ class GlobalPathAnalyzer:
         X = px + q * nx
         Y = py + q * ny
         return (X, Y)
+
+    def compute_optimal_path(self,candidate_paths):
+        # c_total = w_s * c_s + w_sm * c_sm + w_g + c_g + w_d * c_d
+        set_c_s = self.compute_static_obstacle_cost(candidate_paths, len(candidate_paths), self.static_obstacles, threshold=0.25, sigma=1.0)
+        pass
+
+    def compute_static_obstacle_cost(self, candidate_paths, number_of_candidate_paths, static_obstacles, threshold=0.25, sigma=1.0):
+        indicators = np.zeros(number_of_candidate_paths, dtype = float)
+        # 1. 경로 후보의 각 포인트 (x,y)를 추출합니다.
+        for pathnum, candidate_path in enumerate(candidate_paths):
+            points = []
+            for pose in candidate_path.poses:
+                s = pose.pose.position.x
+                q = pose.pose.position.y
+                points.append((s, q))
+            points = np.array(points)  # shape: (N, 2)
+
+            # 2. 각 경로 점에서, 모든 정적 장애물과의 거리 계산 후 충돌 여부 판단
+            if len(static_obstacles) > 0:
+                min_distances = [min(np.hypot(obs[0] - s, obs[1] - q) for obs in static_obstacles) for s, q in points]
+                # 임계값보다 작은 값이 하나라도 있으면 1, 아니면 0 (max() 사용)
+                indicators[pathnum] = max(1 if d < threshold else 0 for d in min_distances)
+            else:
+                indicators[pathnum] = 0  # 장애물이 없으면 0 유지
+
+        # 3. 가우시안 필터를 적용하여 비용을 부드럽게 조정
+        cost_profile = gaussian_filter1d(indicators, sigma=sigma)
+
+        return cost_profile
 
 if __name__ == '__main__':
     try:
