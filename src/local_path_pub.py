@@ -467,6 +467,7 @@ class GlobalPathAnalyzer:
         set_c_sm = []
         for candidate_path in candidate_paths:
             set_c_sm.append(self.compute_smoothness_cost(candidate_path))
+        set_c_g = self.compute_global_path_cost(candidate_paths)
         pass
 
     def compute_static_obstacle_cost(self, candidate_paths, number_of_candidate_paths, static_obstacles, threshold=0.25, sigma=1.0):
@@ -552,6 +553,40 @@ class GlobalPathAnalyzer:
             smooth_cost += (ddq**2) * ds_avg
 
         return smooth_cost
+
+    def compute_global_path_cost(self, candidate_paths):
+        """
+        논문 식 (9)에 따른 전역 경로 추종 비용 C_g[i]를 계산한다.
+        여기서는 각 경로의 '전역 경로로부터의 횡방향 차이'를 하나의 대표값(평균 등)으로 구하고,
+        모든 후보 경로의 값을 합산한 뒤, i-th 경로의 값을 그 합으로 나누어 정규화한다.
+
+        candidate_paths: List[nav_msgs/Path],
+        각 Path는 Frenet 좌표 (s,q)로 저장되었다고 가정 (pose.position.x=s, pose.position.y=q)
+
+        반환값:
+        cg_list: 길이 len(candidate_paths)의 리스트,
+                각 원소는 [0,1] 범위의 비용 (값이 작을수록 전역 경로 추종성이 좋음)
+        """
+        offsets = []
+        for path in candidate_paths:
+            # path 내 모든 점의 |q|를 합산(혹은 평균) -> 이 경로의 전역 경로 편차 지표
+            # 간단히 합산 예시:
+            sum_q = 0.0
+            for pose in path.poses:
+                q_val = pose.pose.position.y  # Frenet 좌표: y=q
+                sum_q += abs(q_val)
+            # 평균을 쓰고 싶다면 sum_q / len(path.poses)
+            offsets.append(sum_q)
+
+        total_offset = sum(offsets)
+        if total_offset < 1e-9:
+            # 모든 경로가 전역 경로에 거의 밀착된 경우 -> 비용을 동일하게 0으로
+            # 혹은 모든 경로를 1/len(...)으로 할당할 수도 있음
+            return [0.0]*len(candidate_paths)
+
+        # 각 경로의 offset / 전체 offset -> [0,1] 정규화
+        cg_list = [offset / total_offset for offset in offsets]
+        return cg_list
 
 if __name__ == '__main__':
     try:
