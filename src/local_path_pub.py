@@ -464,6 +464,9 @@ class GlobalPathAnalyzer:
     def compute_optimal_path(self,candidate_paths):
         # c_total = w_s * c_s + w_sm * c_sm + w_g + c_g + w_d * c_d
         set_c_s = self.compute_static_obstacle_cost(candidate_paths, len(candidate_paths), self.static_obstacles, threshold=0.25, sigma=1.0)
+        set_c_sm = []
+        for candidate_path in candidate_paths:
+            set_c_sm.append(self.compute_smoothness_cost(candidate_path))
         pass
 
     def compute_static_obstacle_cost(self, candidate_paths, number_of_candidate_paths, static_obstacles, threshold=0.25, sigma=1.0):
@@ -489,6 +492,66 @@ class GlobalPathAnalyzer:
         cost_profile = gaussian_filter1d(indicators, sigma=sigma)
 
         return cost_profile
+
+    def compute_smoothness_cost(self, candidate_path):
+        """
+        부드러움 비용 (식 (8)에 대응):
+        C_sm = ∫ (d^2 q / ds^2)^2 ds
+        - candidate_path의 x를 s, y를 q로 저장했다고 가정.
+        - 2차 차분을 통해 d^2 q / ds^2를 근사하고,
+        각 구간 길이 Δs에 대해 (d^2 q/ds^2)^2 * Δs를 합산하여 근사.
+
+        Returns:
+            smooth_cost (float): 경로의 부드러움 비용 (값이 작을수록 매끄러운 경로)
+        """
+
+        # 1) (s, q) 배열로 추출
+        points = []
+        for pose in candidate_path.poses:
+            s_val = pose.pose.position.x  # Frenet 좌표계의 s
+            q_val = pose.pose.position.y  # Frenet 좌표계의 q
+            points.append((s_val, q_val))
+        points = np.array(points)  # shape: (N, 2)
+
+        N = len(points)
+        if N < 3:
+            return 0.0  # 점이 너무 적으면 비용=0
+
+        s_arr = points[:, 0]  # [s0, s1, s2, ...]
+        q_arr = points[:, 1]  # [q0, q1, q2, ...]
+
+        # 2) 각 구간의 Δs, Δq
+        ds_arr = np.diff(s_arr)   # 길이 (N-1)
+        dq_arr = np.diff(q_arr)   # 길이 (N-1)
+
+        # 혹시 Δs가 0이면 작은 값으로 대체 (수치안정)
+        ds_arr[ds_arr < 1e-9] = 1e-9
+
+        # 1차 미분 dq/ds (길이 N-1)
+        dq_ds_arr = dq_arr / ds_arr
+
+        # 3) 2차 미분 d^2q/ds^2
+        #    dq_ds_arr[i] - dq_ds_arr[i-1]을 중간 ds_avg로 나눈다
+        second_derivs = []
+        for i in range(1, len(dq_ds_arr)):
+            dq_ds_diff = dq_ds_arr[i] - dq_ds_arr[i-1]
+            # ds_avg = 평균 ds (예: 0.5 * (ds_arr[i] + ds_arr[i-1]))
+            ds_avg = 0.5 * (ds_arr[i] + ds_arr[i-1])
+            if ds_avg < 1e-9:
+                ds_avg = 1e-9
+            ddq_ds2 = dq_ds_diff / ds_avg
+            second_derivs.append(ddq_ds2)
+        second_derivs = np.array(second_derivs)  # 길이 (N-2)
+
+        # 4) (d^2 q/ds^2)^2 * Δs 적분
+        #    각 i에 대응하는 Δs도 중간값 ds_avg로 근사
+        smooth_cost = 0.0
+        for i in range(1, len(dq_ds_arr)):
+            ddq = second_derivs[i-1]
+            ds_avg = 0.5 * (ds_arr[i] + ds_arr[i-1])  # i, i-1 구간 평균
+            smooth_cost += (ddq**2) * ds_avg
+
+        return smooth_cost
 
 if __name__ == '__main__':
     try:
