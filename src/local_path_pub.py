@@ -14,10 +14,11 @@ from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import Float32MultiArray
 from tf.transformations import euler_from_quaternion
 from morai_msgs.msg import EgoVehicleStatus, CandidatePaths, ObjectStatusList
+from copy import deepcopy
 
 class GlobalPathAnalyzer:
     def __init__(self):
-        rospy.init_node('global_path_analyzer', anonymous=True)
+        rospy.init_node('local_path_pub', anonymous=True)
 
         self.s_candidates = None
 
@@ -38,6 +39,7 @@ class GlobalPathAnalyzer:
         # 장애물 정보
         self.is_obstacle  =False
         self.obstacles_s = []
+        # self.static_obstacles = []
 
         # 이전 루프에서 계산한 s 값
         self.prev_s = None
@@ -53,6 +55,7 @@ class GlobalPathAnalyzer:
         self.candidate_path_pub5 = rospy.Publisher('/candidate_path5', Path, queue_size=1)
         self.candidate_path_pub6 = rospy.Publisher('/candidate_path6', Path, queue_size=1)
         self.candidate_path_pub7 = rospy.Publisher('/candidate_path7', Path, queue_size=1)
+        self.optimal_path_pub = rospy.Publisher('/local_path', Path, queue_size=1)
 
         # 토픽 구독
         rospy.Subscriber("/global_path", Path, self.global_path_callback)
@@ -63,7 +66,7 @@ class GlobalPathAnalyzer:
 
         rate = rospy.Rate(20)  # 20Hz
         while not rospy.is_shutdown():
-            os.system('clear')
+            # os.system('clear')
             if self.is_odom_received and self.is_global_path_ready and self.is_status and self.is_obstacle:
                 """
                 주어진 전역 좌표 (x, y)에 대해, 전역 경로 상의 s 값을 벡터화된 방법으로 계산합니다.
@@ -79,25 +82,42 @@ class GlobalPathAnalyzer:
 
                 # 3) 로컬 경로 생성 (Δs는 차량 속도 및 장애물 정보 반영)
                 # 후보 경로들을 생성 (-1.5부터 1.5까지 0.1 단위)
-                candidate_paths_list = self.generate_candidate_paths(s0, q0)
+                candidate_paths_list, cart_candidate_paths_list = self.generate_cadidate_paths(s0, q0)
+                candidate_paths_list, cart_candidate_paths_list = self.generate_cadidate_paths(s0, q0)
 
                 # CandidatePaths 커스텀 메시지에 모든 후보 경로 저장
                 candidate_paths_msg = CandidatePaths()
                 candidate_paths_msg.paths = candidate_paths_list
 
-                # 최적 경로 선택
-                optimal_path = self.compute_optimal_path(candidate_paths_msg.paths)
+                cart_candidate_paths_msg = CandidatePaths()
+                cart_candidate_paths_msg.paths = cart_candidate_paths_list
 
-                # 퍼블리시 (한 번에 모든 후보 경로 전달)
-                self.candidate_path_pub.publish(candidate_paths_msg)
-                self.candidate_path_pub1.publish(candidate_paths_msg.paths[0])
-                self.candidate_path_pub2.publish(candidate_paths_msg.paths[1])
-                self.candidate_path_pub3.publish(candidate_paths_msg.paths[2])
-                self.candidate_path_pub4.publish(candidate_paths_msg.paths[3])
-                self.candidate_path_pub5.publish(candidate_paths_msg.paths[4])
-                self.candidate_path_pub6.publish(candidate_paths_msg.paths[5])
-                self.candidate_path_pub7.publish(candidate_paths_msg.paths[6])
-                candidate_path = candidate_paths_msg.paths[6]
+                # 최적 경로 선택 후
+                optimal_path, min_idx = self.compute_optimal_path(candidate_paths_msg.paths)
+                self.optimal_path_pub.publish(optimal_path)
+
+                # cart_candidate_paths_msg.paths 는 후보 경로들이 Cartesian 좌표로 변환된 리스트라고 가정합니다.
+                # 각 후보 경로를 발행하는 publisher들을 리스트로 만듭니다.
+                all_publishers = [
+                    self.candidate_path_pub1,
+                    self.candidate_path_pub2,
+                    self.candidate_path_pub3,
+                    self.candidate_path_pub4,
+                    self.candidate_path_pub5,
+                    self.candidate_path_pub6,
+                    self.candidate_path_pub7
+                ]
+
+                # 후보 경로 리스트와 해당 인덱스를 추출합니다.
+                candidate_paths = cart_candidate_paths_msg.paths  # 예: 이미 Cartesian 좌표로 변환된 후보 경로 리스트
+                # 최적 경로(인덱스 min_idx)를 제외한 후보 경로와 그에 대응하는 publisher 리스트를 생성합니다.
+                filtered_paths = [path for i, path in enumerate(candidate_paths) if i != min_idx]
+                filtered_publishers = [pub for i, pub in enumerate(all_publishers) if i != min_idx]
+
+                # 각 후보 경로를 대응하는 publisher를 통해 발행합니다.
+                for pub, path in zip(filtered_publishers, filtered_paths):
+                    pub.publish(path)
+                # candidate_path = candidate_paths_msg.paths[6]
                 # print("Candidate Path 6:")
                 # for i, pose in enumerate(candidate_path.poses):
                 #     x = pose.pose.position.x
@@ -284,7 +304,7 @@ class GlobalPathAnalyzer:
     # ---------------------------------------------------------
     # (C) Δs 결정: 속도 및 장애물 정보를 반영 (식 (6) 및 Algorithm 2)
     # ---------------------------------------------------------
-    def compute_delta_s_vel(self, v, a_min=-3.0, s_min=10.0, s_max=20.0):
+    def compute_delta_s_vel(self, v, a_min=-8.0, s_min=5.0, s_max=10.0):
         """
         논문 식 (6)에 따라 차량 속도 v (m/s), 최소 가속도 a_min,
         최소/최대 호 길이(s_min, s_max)를 고려해 Δs를 계산.
@@ -295,7 +315,7 @@ class GlobalPathAnalyzer:
         else:
             return s_max
 
-    def compute_delta_s_with_obstacles(self, s_vehicle, s_vel, s_min=10.0):
+    def compute_delta_s_with_obstacles(self, s_vehicle, s_vel, s_min=5.0):
         """
         장애물이 있을 경우, 차량 앞쪽 장애물까지의 s 거리 중 최소값과 s_vel, s_min 중 최솟값을 사용.
         장애물이 없다면 s_vel 반환.
@@ -311,7 +331,7 @@ class GlobalPathAnalyzer:
             return s_vel
         else:
             s_obs = min(dist_candidates)
-            return min(s_obs, s_min)
+            return max(min(s_obs, s_min),5.0)
 
     def normalize_angle(self, angle):
         """
@@ -323,17 +343,19 @@ class GlobalPathAnalyzer:
     # ---------------------------------------------------------
     # 3) 로컬 경로(후보 경로) 생성 (3차 스플라인 q(s) 이용)
     # ---------------------------------------------------------
-    def generate_candidate_paths(self, s0, q0):
+    def generate_cadidate_paths(self, s0, q0):
         """
         s0: 시작 호 길이 (현재 차량 위치에 해당)
         q0: 현재 횡방향 오프셋 (signed_lateral_offset 함수로 구한 값)
         이 함수를 통해 -1.5부터 1.5까지 0.1 간격의 후보 경로들을 생성합니다.
         """
         candidate_paths = []
+        cart_candidate_paths = []
         for lane_offset in np.arange(-1.5, 1.5 + 0.001, 0.5):
-            path_msg = self.generate_local_path(s0, q0, lane_offset)
+            path_msg, cart_path_msg = self.generate_local_path(s0, q0, lane_offset)
             candidate_paths.append(path_msg)
-        return candidate_paths
+            cart_candidate_paths.append(cart_path_msg)
+        return candidate_paths, cart_candidate_paths
 
     def generate_local_path(self, s0, q0, lane_offset):
         """
@@ -344,9 +366,12 @@ class GlobalPathAnalyzer:
         path_msg = Path()
         path_msg.header.frame_id = "map"
 
+        cart_path_msg = Path()
+        cart_path_msg.header.frame_id = "map"
+
         # (a) Δs 결정: 차량 속도와 장애물 정보를 반영하여 Δs를 구함
-        s_vel = self.compute_delta_s_vel(self.current_speed, a_min = -3.0, s_min=10.0)
-        final_delta_s = self.compute_delta_s_with_obstacles(s0, s_vel, s_min=10.0)
+        s_vel = self.compute_delta_s_vel(self.current_speed, a_min = -8.0, s_min=5.0)
+        final_delta_s = self.compute_delta_s_with_obstacles(s0, s_vel, s_min=5.0)
 
         # (b) 경계 조건:
         # 시작점: q(s0)=q0, q'(s0)=tan(Δθ)
@@ -385,7 +410,7 @@ class GlobalPathAnalyzer:
             s_val = (s0 + t) % self.total_length
             # print("s_val = %.3f, q_val = %.3f",s_val,q_val)
             # 4-3) Frenet -> Cartesian 변환
-            # X, Y = self.frenet_to_cartesian(s_val, q_val)
+            X, Y = self.frenet_to_cartesian(s_val, q_val)
 
             pose = PoseStamped()
             pose.header.frame_id = "map"
@@ -394,7 +419,14 @@ class GlobalPathAnalyzer:
             pose.pose.orientation.w = 1.0
             path_msg.poses.append(pose)
 
-        return path_msg
+            cart_pose = PoseStamped()
+            cart_pose.header.frame_id = "map"
+            cart_pose.pose.position.x = X
+            cart_pose.pose.position.y = Y
+            cart_pose.pose.orientation.w = 1.0
+            cart_path_msg.poses.append(cart_pose)
+
+        return path_msg,cart_path_msg
 
 
     # ---------------------------------------------------------
@@ -461,16 +493,84 @@ class GlobalPathAnalyzer:
         Y = py + q * ny
         return (X, Y)
 
-    def compute_optimal_path(self,candidate_paths):
-        # c_total = w_s * c_s + w_sm * c_sm + w_g + c_g + w_d * c_d
-        set_c_s = self.compute_static_obstacle_cost(candidate_paths, len(candidate_paths), self.static_obstacles, threshold=0.25, sigma=1.0)
+    def convert_frenet_path_to_cartesian(self, frenet_path):
+        """
+        frenet_path: nav_msgs/Path
+        - pose.position.x = s
+        - pose.position.y = q
+        를 전역 좌표 (X, Y)로 변환한 새 Path를 리턴.
+        """
+        cartesian_path = deepcopy(frenet_path)
+        cartesian_path.poses = []  # Pose 배열은 새로 만든다.
+
+        for pose in frenet_path.poses:
+            s_val = pose.pose.position.x
+            q_val = pose.pose.position.y
+            X, Y = self.frenet_to_cartesian(s_val, q_val)
+
+            new_pose = deepcopy(pose)
+            new_pose.pose.position.x = X
+            new_pose.pose.position.y = Y
+            # 필요하면 orientation도 계산할 수 있으나, 여기서는 w=1.0 등 간단히 처리 가능
+            cartesian_path.poses.append(new_pose)
+
+        return cartesian_path
+
+    def compute_optimal_path(self, candidate_paths):
+        """
+        후보 경로들에 대해
+            c_total = w_s*c_s + w_sm*c_sm + w_g*c_g (+ w_d*c_d)
+        를 계산하고, 가장 비용이 낮은 경로(최적 경로)를 리턴한다.
+
+        Returns:
+            best_path: 비용이 가장 낮은 nav_msgs/Path
+            best_cost: 해당 경로의 총 비용
+        """
+        # 가중치 (동적 장애물 비용 w_d는 0으로 가정)
+        w_s = 3.0   # 정적 장애물 비용 가중치 # 경로에서 정적 장애물 회피하려면 최소 w_s : w_sm = 1 : 1 필요
+        w_sm = 3.0  # 부드러움 비용 가중치 # 곡선 구간에서 인코스를 방지하려면 최소 w_sm : w_g = 3 : 1 필요
+        w_g = 1.0   # 전역 경로 추종 비용 가중치
+        w_d = 0.0   # 동적 장애물 비용 (미구현 상태)
+
+        # 1) 정적 장애물 비용 (각 후보 경로마다 값이 계산됨)
+        set_c_s = self.compute_static_obstacle_cost(
+            candidate_paths,
+            len(candidate_paths),
+            self.obstacles_s,
+            threshold=1.0,
+            sigma=1.0
+        )
+        # 2) 부드러움 비용
         set_c_sm = []
         for candidate_path in candidate_paths:
-            set_c_sm.append(self.compute_smoothness_cost(candidate_path))
-        set_c_g = self.compute_global_path_cost(candidate_paths)
-        pass
+            c_sm = self.compute_smoothness_cost_xy(candidate_path)
+            set_c_sm.append(c_sm)
 
-    def compute_static_obstacle_cost(self, candidate_paths, number_of_candidate_paths, static_obstacles, threshold=0.25, sigma=1.0):
+        # 3) 전역 경로 추종 비용
+        set_c_g = self.compute_global_path_cost(candidate_paths)
+
+        # 4) 총 비용 계산
+        c_totals = []
+        for i in range(len(candidate_paths)):
+            c_total = (w_s  * set_c_s[i]
+                        + w_sm * set_c_sm[i]
+                        + w_g  * set_c_g[i]
+                        + w_d  * 0.0)  # 동적 장애물 비용 미구현이므로 0
+            c_totals.append(c_total)
+            rospy.loginfo("Candidate %d: c_static=%.3f, c_smooth=%.3f, c_global=%.3f, total_cost=%.3f",
+                      i, w_s  * set_c_s[i], w_sm * set_c_sm[i], w_g  * set_c_g[i], c_total)
+
+        # 5) 최적 경로 선택 (가장 비용이 낮은 인덱스)
+        min_idx = np.argmin(c_totals)
+        best_path = candidate_paths[min_idx]
+        best_cost = c_totals[min_idx]
+
+        # Frenet -> Cartesian 변환
+        best_cartesian_path = self.convert_frenet_path_to_cartesian(best_path)
+
+        return best_cartesian_path,min_idx
+
+    def compute_static_obstacle_cost(self, candidate_paths, number_of_candidate_paths, static_obstacles, threshold=1.0, sigma=1.0):
         indicators = np.zeros(number_of_candidate_paths, dtype = float)
         # 1. 경로 후보의 각 포인트 (x,y)를 추출합니다.
         for pathnum, candidate_path in enumerate(candidate_paths):
@@ -494,65 +594,67 @@ class GlobalPathAnalyzer:
 
         return cost_profile
 
-    def compute_smoothness_cost(self, candidate_path):
+    def compute_smoothness_cost_xy(self, frenet_path):
         """
-        부드러움 비용 (식 (8)에 대응):
-        C_sm = ∫ (d^2 q / ds^2)^2 ds
-        - candidate_path의 x를 s, y를 q로 저장했다고 가정.
-        - 2차 차분을 통해 d^2 q / ds^2를 근사하고,
-        각 구간 길이 Δs에 대해 (d^2 q/ds^2)^2 * Δs를 합산하여 근사.
-
-        Returns:
-            smooth_cost (float): 경로의 부드러움 비용 (값이 작을수록 매끄러운 경로)
+        1) frenet_path (s,q) -> (X,Y)로 변환
+        2) XY 좌표에서 곡률(kappa)을 구해, kappa^2 * ds 적분 근사
+        3) 반환값이 작을수록 실제 XY 평면에서 '물리적'으로 부드러운 경로
         """
 
-        # 1) (s, q) 배열로 추출
-        points = []
-        for pose in candidate_path.poses:
-            s_val = pose.pose.position.x  # Frenet 좌표계의 s
-            q_val = pose.pose.position.y  # Frenet 좌표계의 q
-            points.append((s_val, q_val))
-        points = np.array(points)  # shape: (N, 2)
+        import numpy as np
 
-        N = len(points)
+        # (A) Frenet -> Cartesian 변환
+        xy_points = []
+        for pose in frenet_path.poses:
+            s_val = pose.pose.position.x
+            q_val = pose.pose.position.y
+            X, Y = self.frenet_to_cartesian(s_val, q_val)  # 전역 좌표계로 변환
+            xy_points.append((X, Y))
+
+        xy_points = np.array(xy_points)  # shape (N, 2)
+        N = len(xy_points)
         if N < 3:
-            return 0.0  # 점이 너무 적으면 비용=0
+            return 0.0
 
-        s_arr = points[:, 0]  # [s0, s1, s2, ...]
-        q_arr = points[:, 1]  # [q0, q1, q2, ...]
+        # (B) 곡률 계산에 필요한 구간 길이 ds, 곡률 근사
+        total_cost = 0.0
+        for i in range(1, N-1):
+            x_prev, y_prev = xy_points[i-1]
+            x_curr, y_curr = xy_points[i]
+            x_next, y_next = xy_points[i+1]
 
-        # 2) 각 구간의 Δs, Δq
-        ds_arr = np.diff(s_arr)   # 길이 (N-1)
-        dq_arr = np.diff(q_arr)   # 길이 (N-1)
+            # ds_prev, ds_next
+            ds_prev = np.hypot(x_curr - x_prev, y_curr - y_prev)
+            ds_next = np.hypot(x_next - x_curr, y_next - y_curr)
+            ds_avg = 0.5*(ds_prev + ds_next)
 
-        # 혹시 Δs가 0이면 작은 값으로 대체 (수치안정)
-        ds_arr[ds_arr < 1e-9] = 1e-9
+            # 곡률 근사 (삼각형 외접원 방식)
+            kappa = self.approx_curvature(x_prev, y_prev, x_curr, y_curr, x_next, y_next)
+            total_cost += (kappa**2)*ds_avg
 
-        # 1차 미분 dq/ds (길이 N-1)
-        dq_ds_arr = dq_arr / ds_arr
+        return total_cost
 
-        # 3) 2차 미분 d^2q/ds^2
-        #    dq_ds_arr[i] - dq_ds_arr[i-1]을 중간 ds_avg로 나눈다
-        second_derivs = []
-        for i in range(1, len(dq_ds_arr)):
-            dq_ds_diff = dq_ds_arr[i] - dq_ds_arr[i-1]
-            # ds_avg = 평균 ds (예: 0.5 * (ds_arr[i] + ds_arr[i-1]))
-            ds_avg = 0.5 * (ds_arr[i] + ds_arr[i-1])
-            if ds_avg < 1e-9:
-                ds_avg = 1e-9
-            ddq_ds2 = dq_ds_diff / ds_avg
-            second_derivs.append(ddq_ds2)
-        second_derivs = np.array(second_derivs)  # 길이 (N-2)
-
-        # 4) (d^2 q/ds^2)^2 * Δs 적분
-        #    각 i에 대응하는 Δs도 중간값 ds_avg로 근사
-        smooth_cost = 0.0
-        for i in range(1, len(dq_ds_arr)):
-            ddq = second_derivs[i-1]
-            ds_avg = 0.5 * (ds_arr[i] + ds_arr[i-1])  # i, i-1 구간 평균
-            smooth_cost += (ddq**2) * ds_avg
-
-        return smooth_cost
+    def approx_curvature(self, x_prev, y_prev, x_curr, y_curr, x_next, y_next):
+        """
+        세 점을 이용해 곡률(kappa)을 근사:
+        kappa ~ 2*sin(theta) / chord
+        theta = angle between vec(a) and vec(b)
+        chord = dist between first & last point
+        """
+        a = np.array([x_curr - x_prev, y_curr - y_prev])
+        b = np.array([x_next - x_curr, y_next - y_curr])
+        dot_ab = a.dot(b)
+        cross_ab = a[0]*b[1] - a[1]*b[0]
+        mag_a = np.hypot(a[0], a[1])
+        mag_b = np.hypot(b[0], b[1])
+        if mag_a < 1e-9 or mag_b < 1e-9:
+            return 0.0
+        sin_theta = abs(cross_ab)/(mag_a*mag_b)
+        chord = np.hypot(x_next - x_prev, y_next - y_prev)
+        if chord < 1e-9:
+            return 0.0
+        kappa = 2.0*sin_theta/chord
+        return kappa
 
     def compute_global_path_cost(self, candidate_paths):
         """
