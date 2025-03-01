@@ -549,13 +549,20 @@ class GlobalPathAnalyzer:
         # 3) 전역 경로 추종 비용
         set_c_g = self.compute_global_path_cost(candidate_paths)
 
+        # 4) 동적 장애물 비용
+        set_c_d = self.compute_dynamic_cost(candidate_paths)
+        # set_c_d = []
+        # for candidate_path in candidate_paths:
+        #     c_d = self.compute_dynamic_cost(candidate_path)
+        #     set_c_d.append(c_d)
+
         # 4) 총 비용 계산
         c_totals = []
         for i in range(len(candidate_paths)):
             c_total = (w_s  * set_c_s[i]
                         + w_sm * set_c_sm[i]
                         + w_g  * set_c_g[i]
-                        + w_d  * 0.0)  # 동적 장애물 비용 미구현이므로 0
+                        + w_d  * set_c_d[i])  # 동적 장애물 비용 미구현이므로 0
             c_totals.append(c_total)
             rospy.loginfo("Candidate %d: c_static=%.3f, c_smooth=%.3f, c_global=%.3f, total_cost=%.3f",
                       i, w_s  * set_c_s[i], w_sm * set_c_sm[i], w_g  * set_c_g[i], c_total)
@@ -689,6 +696,90 @@ class GlobalPathAnalyzer:
         # 각 경로의 offset / 전체 offset -> [0,1] 정규화
         cg_list = [offset / total_offset for offset in offsets]
         return cg_list
+
+    def compute_dynamic_cost(self, candidate_paths):
+        """
+        동적 장애물 비용을 계산하는 함수.
+
+        각 후보 경로(candidate_path)에 대해:
+        1. 후보 경로의 마지막 점의 s값을 s_c[i]로 보고,
+            차량이 그 지점까지 주행하는 시간: t_veh[i] = s_c[i] / v_veh.
+        2. self.dynamic_obstacles에 있는 각 동적 장애물(각각 (s, q, v_s))에 대해,
+            장애물이 후보 경로 충돌 지점까지 도달하는 시간 t_obs_candidate = (s_c[i] - s_obs) / v_obs (s_obs < s_c인 경우) 를 계산.
+            t_obs[i]는 이들 중 최소값.
+        3. Δt[i] = t_obs[i] - t_veh[i]를 계산하여,
+            - Δt[i] > 0 인 경우: 끼어들기(cut-in) 상황
+            - Δt[i] <= 0 인 경우: 따라가기(follow) 상황 (Δt[i] = 0인 경우도 follow로 처리)
+        4. [Cut-in 시나리오 (식 12, 13)]
+            - delta_cut = s_c[i] + L_cut_in - v_veh * t_obs[i]
+            - if delta_cut <= 0: a_req = 0
+            else: a_req = 2 * delta_cut / (t_obs[i])^2
+            - 동적 비용: C_d[i] = |a_req| * (s_c[i] + L_cut_in)
+        5. [Follow 시나리오 (식 14, 15, 16)]
+            - L_follow = L_0 if L_0 <= s_c[i] else s_c[i]
+            - delta_follow = s_c[i] - L_follow - v_veh * t_obs[i]
+            - if delta_follow <= 0: a_req = 0
+            else: a_req = 2 * delta_follow / (t_obs[i])^2
+            - 동적 비용: C_d[i] = |a_req| * (s_c[i] - L_follow)
+
+        Returns:
+        dynamic_costs: 각 후보 경로별 동적 장애물 비용의 리스트.
+        """
+        import numpy as np
+
+        dynamic_costs = []
+        L_cut_in = 2.0  # 끼어들기 위해 필요한 추가 거리 (예시)
+        L0 = 3.0       # 기본 추종 거리 (예시)
+
+        # 현재 차량 속도 (m/s); 너무 작으면 1e-3로 처리
+        v_veh = self.current_speed if self.current_speed > 1e-3 else 1e-3
+
+        for candidate_path in candidate_paths:
+            # 1. 후보 경로의 마지막 점의 s 값을 s_c로 사용
+            s_c = candidate_path.poses[-1].pose.position.x
+            t_veh = s_c / v_veh
+
+            # 2. 동적 장애물 중, 후보 경로의 충돌(또는 추종) 지점에 해당하는 장애물 고려
+            t_obs_candidates = []
+            for obs in self.dynamic_obstacles:
+                # obs는 (s, q, v_s) 튜플로 가정
+                obs_s = obs[0]
+                v_obs = obs[2] if obs[2] > 1e-3 else 1e-3
+                # 장애물이 후보 경로 충돌 지점 앞쪽에 있다면 (obs_s < s_c)
+                if obs_s < s_c:
+                    t_obs_candidate = (s_c - obs_s) / v_obs
+                    t_obs_candidates.append(t_obs_candidate)
+            if len(t_obs_candidates) == 0:
+                t_obs_min = float('inf')
+            else:
+                t_obs_min = min(t_obs_candidates)
+
+            # 3. 시간 차이 Δt
+            delta_t = t_obs_min - t_veh
+
+            if delta_t > 0:
+                # Cut-in 시나리오: 차량이 도착하기 전에 장애물이 해당 지점에 도달함.
+                delta_cut = s_c + L_cut_in - v_veh * t_obs_min
+                if delta_cut <= 0:
+                    a_req = 0.0
+                else:
+                    a_req = 2.0 * delta_cut / (t_obs_min**2)
+                cost = abs(a_req) * (s_c + L_cut_in)
+            else:
+                # Follow 시나리오: Δt <= 0이면 차량이 먼저 도착하거나 딱 맞으므로, 장애물을 따라가야 함.
+                L_follow = L0 if L0 <= s_c else s_c
+                delta_follow = s_c - L_follow - v_veh * t_obs_min
+                if delta_follow <= 0:
+                    a_req = 0.0
+                else:
+                    a_req = 2.0 * delta_follow / (t_obs_min**2)
+                cost = abs(a_req) * (s_c - L_follow)
+
+            dynamic_costs.append(cost)
+            rospy.loginfo("Candidate: s_c=%.3f, t_veh=%.3f, t_obs=%.3f, Δt=%.3f, cost=%.3f",
+                        s_c, t_veh, t_obs_min, delta_t, cost)
+
+        return dynamic_costs
 
 if __name__ == '__main__':
     try:
