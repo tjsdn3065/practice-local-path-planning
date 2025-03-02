@@ -5,7 +5,7 @@ import rospy
 import os
 import math
 import numpy as np
-from math import pi, hypot
+from math import pi, hypot, sqrt
 from scipy.interpolate import CubicSpline
 from scipy.ndimage import gaussian_filter1d
 
@@ -206,35 +206,88 @@ class GlobalPathAnalyzer:
     # ---------------------------------------------------------
     def obstacle_callback(self, msg):
         """
-        ObjectStatusList 메시지에서 obstacle_list에 있는 각 장애물의
-        위치를 이용하여, 전역 경로 상의 s 좌표를 계산하고 self.obstacles_s에 업데이트합니다.
+        ObjectStatusList 메시지에서 obstacle_list에 있는 각 동적 장애물의 위치, 속도, 가속도를 이용하여,
+        전역 경로 상의 Frenet 좌표 (s, q)와 함께 속도, 가속도 (v_s, v_q, a_s, a_q)를 계산하고,
+        self.dynamic_obstacles에 저장합니다.
+        각 장애물은 (s, q, v_s, v_q, a_s, a_q) 튜플로 저장됩니다.
         """
         if not self.is_global_path_ready:
             rospy.logwarn("전역 경로가 아직 준비되지 않았습니다.")
             return
         self.is_obstacle = True
-        obstacles_s = []
-
+        dyn_obs = []
         for obstacle in msg.obstacle_list:
+            # 장애물의 전역 위치 (x, y)
             x_obs = obstacle.position.x
             y_obs = obstacle.position.y
-            s_val, q_val = self.compute_obstacle_frenet(x_obs, y_obs)
-            # q_obs가 1.5보다 큰 경우 제외
-            if abs(q_val) <= 1.5:
-                obstacles_s.append((s_val, q_val))
-        self.obstacles_s = obstacles_s
+            # 전역 속도 벡터 (v_x, v_y)와 가속도 벡터 (a_x, a_y)
+            v_x = obstacle.velocity.x
+            v_y = obstacle.velocity.y
+            a_x = obstacle.acceleration.x
+            a_y = obstacle.acceleration.y
+            # Frenet 좌표 및 속도/가속도 변환
+            s_obs, q_obs, v_s, v_q, a_s, a_q = self.compute_obstacle_frenet_all(x_obs, y_obs, v_x, v_y, a_x, a_y)
+            # |q_obs|가 1.5 이하인 경우만 저장
+            if abs(q_obs) <= 1.5:
+                dyn_obs.append((s_obs, q_obs, v_s, v_q, a_s, a_q))
+        self.obstacles_s = dyn_obs
+        rospy.loginfo("동적 장애물 업데이트: %s", self.obstacles_s)
 
-    def compute_obstacle_frenet(self, x_obs, y_obs):
+    def compute_obstacle_frenet_all(self, x_obs, y_obs, v_x, v_y, a_x, a_y):
+        """
+        주어진 전역 좌표 (x_obs, y_obs), 속도 (v_x, v_y), 가속도 (a_x, a_y)를
+        전역 경로에 투영하여, Frenet 좌표 (s, q)와 함께, 속도와 가속도를 Frenet 좌표 성분(v_s, v_q, a_s, a_q)으로 변환합니다.
+        """
+        # 1. 위치 변환: s, q 계산 (기존 방식)
         s_obs = self.compute_s_coordinate(x_obs, y_obs)
         q_obs = self.signed_lateral_offset(x_obs, y_obs, s_obs)
-        return s_obs, q_obs
+
+        # 2. 전역 경로에서 s_obs 위치에서 접선 벡터 T와 법선 벡터 N 계산
+        # T = (dx/ds, dy/ds) normalized
+        T_x = self.cs_x.derivative()(s_obs)
+        T_y = self.cs_y.derivative()(s_obs)
+        T_norm = sqrt(T_x**2 + T_y**2)
+        if T_norm < 1e-6:
+            T_norm = 1e-6
+        T_x /= T_norm
+        T_y /= T_norm
+
+        # N = (-T_y, T_x) (여기서는 왼쪽이 +q라고 가정)
+        N_x = -T_y
+        N_y = T_x
+
+        # 3. 전역 속도와 가속도를 Frenet 성분으로 변환
+        # 속도: v_s = v · T, v_q = v · N
+        v_s = v_x * T_x + v_y * T_y
+        v_q = v_x * N_x + v_y * N_y
+
+        # 4. 전역 가속도 벡터를 Frenet 성분으로 변환
+        # 곡률 kappa = (x'(s)*y''(s) - y'(s)*x''(s)) / ((x'(s)^2 + y'(s)^2)^(3/2))
+        cs_x_prime = self.cs_x.derivative()(s_obs)
+        cs_y_prime = self.cs_y.derivative()(s_obs)
+        cs_x_second = self.cs_x.derivative(2)(s_obs)
+        cs_y_second = self.cs_y.derivative(2)(s_obs)
+        denom = (cs_x_prime**2 + cs_y_prime**2)**1.5
+        if denom < 1e-6:
+            kappa = 0.0
+        else:
+            kappa = (cs_x_prime * cs_y_second - cs_y_prime * cs_x_second) / denom
+
+        # Frenet 가속도 공식:
+        # a_s = T·a - kappa * v_q^2
+        # a_q = N·a + kappa * v_s * v_q
+        a_s = a_x * T_x + a_y * T_y - kappa * (v_q**2)
+        a_q = a_x * N_x + a_y * N_y + kappa * v_s * v_q
+
+        return s_obs, q_obs, v_s, v_q, a_s, a_q
 
     def compute_s_coordinate(self, x, y):
-        # 전역 경로의 x, y 좌표를 한 번에 계산 (벡터화)
+        """
+        주어진 전역 좌표 (x, y)에 대해, 전역 경로 상의 s 값을 벡터화된 방법으로 계산합니다.
+        self.s_candidates는 미리 생성되어 있다고 가정합니다.
+        """
         xs = self.cs_x(self.s_candidates)
         ys = self.cs_y(self.s_candidates)
-
-        # 장애물 위치와의 거리 제곱을 벡터화하여 계산
         distances = (x - xs)**2 + (y - ys)**2
         s_best = self.s_candidates[np.argmin(distances)]
         return s_best
@@ -536,7 +589,6 @@ class GlobalPathAnalyzer:
         set_c_s = self.compute_static_obstacle_cost(
             candidate_paths,
             len(candidate_paths),
-            self.obstacles_s,
             threshold=1.0,
             sigma=1.0
         )
@@ -577,7 +629,7 @@ class GlobalPathAnalyzer:
 
         return best_cartesian_path,min_idx
 
-    def compute_static_obstacle_cost(self, candidate_paths, number_of_candidate_paths, static_obstacles, threshold=1.0, sigma=1.0):
+    def compute_static_obstacle_cost(self, candidate_paths, number_of_candidate_paths, threshold=1.0, sigma=1.0):
         indicators = np.zeros(number_of_candidate_paths, dtype = float)
         # 1. 경로 후보의 각 포인트 (x,y)를 추출합니다.
         for pathnum, candidate_path in enumerate(candidate_paths):
@@ -589,8 +641,8 @@ class GlobalPathAnalyzer:
             points = np.array(points)  # shape: (N, 2)
 
             # 2. 각 경로 점에서, 모든 정적 장애물과의 거리 계산 후 충돌 여부 판단
-            if len(static_obstacles) > 0:
-                min_distances = [min(np.hypot(obs[0] - s, obs[1] - q) for obs in static_obstacles) for s, q in points]
+            if len(self.obstacles_s) > 0:
+                min_distances = [min(np.hypot(obs[0] - s, obs[1] - q) for obs in self.obstacles_s) for s, q in points]
                 # 임계값보다 작은 값이 하나라도 있으면 1, 아니면 0 (max() 사용)
                 indicators[pathnum] = max(1 if d < threshold else 0 for d in min_distances)
             else:
@@ -725,24 +777,29 @@ class GlobalPathAnalyzer:
         Returns:
         dynamic_costs: 각 후보 경로별 동적 장애물 비용의 리스트.
         """
-        import numpy as np
-
         dynamic_costs = []
         L_cut_in = 2.0  # 끼어들기 위해 필요한 추가 거리 (예시)
-        L0 = 3.0       # 기본 추종 거리 (예시)
+        L0 = 2.0       # 기본 추종 거리 (예시)
 
         # 현재 차량 속도 (m/s); 너무 작으면 1e-3로 처리
         v_veh = self.current_speed if self.current_speed > 1e-3 else 1e-3
 
         for candidate_path in candidate_paths:
-            # 1. 후보 경로의 마지막 점의 s 값을 s_c로 사용
-            s_c = candidate_path.poses[-1].pose.position.x
+            # 1. 후보 경로의 로컬 길이 s_c 계산 (각 (s,q) 점 간 유클리드 거리 누적)
+            s_c = 0.0
+            poses = candidate_path.poses
+            for i in range(1, len(poses)):
+                s_prev = poses[i-1].pose.position.x
+                q_prev = poses[i-1].pose.position.y
+                s_curr = poses[i].pose.position.x
+                q_curr = poses[i].pose.position.y
+                s_c += np.hypot(s_curr - s_prev, q_curr - q_prev)
             t_veh = s_c / v_veh
 
             # 2. 동적 장애물 중, 후보 경로의 충돌(또는 추종) 지점에 해당하는 장애물 고려
             t_obs_candidates = []
-            for obs in self.dynamic_obstacles:
-                # obs는 (s, q, v_s) 튜플로 가정
+            for obs in self.obstacles_s:
+                # obs는 (s, q, v_s, v_q, a_s, a_q) 튜플로 가정
                 obs_s = obs[0]
                 v_obs = obs[2] if obs[2] > 1e-3 else 1e-3
                 # 장애물이 후보 경로 충돌 지점 앞쪽에 있다면 (obs_s < s_c)
