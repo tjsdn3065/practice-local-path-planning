@@ -20,14 +20,23 @@ class GlobalPathAnalyzer:
     def __init__(self):
         rospy.init_node('local_path_pub', anonymous=True)
 
-        self.s_candidates = None
-
         # 전역 경로 보간 관련 변수
-        self.cs_x = None
-        self.cs_y = None
-        self.s_vals = None
-        self.total_length = None
-        self.is_global_path_ready = False
+        self.inside_cs_x = None
+        self.inside_cs_y = None
+        self.inside_s_vals = None
+        self.inside_total_length = None
+        self.is_inside_global_path_ready = False
+        self.inside_s_candidates = None
+
+        self.outside_cs_x = None
+        self.outside_cs_y = None
+        self.outside_s_vals = None
+        self.outside_total_length = None
+        self.is_outside_global_path_ready = False
+        self.outside_s_candidates = None
+
+        self.choiced_path = None # 0이면 inside, 1이면 outside
+        self.sub_q = None
 
         # 오도메트리 수신 여부 및 위치/헤딩
         self.is_odom_received = False
@@ -40,9 +49,6 @@ class GlobalPathAnalyzer:
         self.is_obstacle  =False
         self.obstacles_s = []
         # self.static_obstacles = []
-
-        # 이전 루프에서 계산한 s 값
-        self.prev_s = None
 
         # 디버그 및 로컬 경로 발행
         # self.debug_pub = rospy.Publisher('/debug_s0_q0', Float32MultiArray, queue_size=1)
@@ -58,7 +64,8 @@ class GlobalPathAnalyzer:
         self.optimal_path_pub = rospy.Publisher('/local_path', Path, queue_size=1)
 
         # 토픽 구독
-        rospy.Subscriber("/global_path", Path, self.global_path_callback)
+        rospy.Subscriber("/inside_global_path", Path, self.inside_global_path_callback)
+        rospy.Subscriber("/outside_global_path", Path, self.outside_global_path_callback)
         rospy.Subscriber("/odom", Odometry, self.odom_callback)
 
         rospy.Subscriber("/Object_topic", ObjectStatusList, self.obstacle_callback)
@@ -66,23 +73,42 @@ class GlobalPathAnalyzer:
 
         rate = rospy.Rate(20)  # 20Hz
         while not rospy.is_shutdown():
-            # os.system('clear')
-            if self.is_odom_received and self.is_global_path_ready and self.is_status and self.is_obstacle:
+            os.system('clear')
+            if self.is_odom_received and self.is_inside_global_path_ready and self.is_outside_global_path_ready and self.is_status and self.is_obstacle:
                 """
                 주어진 전역 좌표 (x, y)에 대해, 전역 경로 상의 s 값을 벡터화된 방법으로 계산합니다.
                 """
                 # 만약 self.s_candidates가 존재하지 않으면 미리 계산해둡니다.
-                if not hasattr(self, 's_candidates') or self.s_candidates is None:
-                    num_samples = 1000  # 필요에 따라 조절
-                    self.s_candidates = np.linspace(0, self.total_length, num_samples)
+                if not hasattr(self, 'inside_s_candidates') or self.inside_s_candidates is None:
+                    num_samples = 3000  # 필요에 따라 조절
+                    self.inside_s_candidates = np.linspace(0, self.inside_total_length, num_samples)
+                if not hasattr(self, 'outside_s_candidates') or self.outside_s_candidates is None:
+                    num_samples = 3000  # 필요에 따라 조절
+                    self.outside_s_candidates = np.linspace(0, self.outside_total_length, num_samples)
+
                 # 1) 현재 위치로부터 s0 계산
-                s0 = self.find_closest_s_newton(self.current_x, self.current_y)
+                inside_s0 = self.inside_find_closest_s_newton(self.current_x, self.current_y)
+                outside_s0 = self.outside_find_closest_s_newton(self.current_x, self.current_y)
                 # 2) 현재 횡방향 오프셋 q0 계산
-                q0 = self.signed_lateral_offset(self.current_x, self.current_y, s0)
+                inside_q0 = self.inside_signed_lateral_offset(self.current_x, self.current_y, inside_s0)
+                outside_q0 = self.outside_signed_lateral_offset(self.current_x, self.current_y, outside_s0)
+
+                print("inside_q0:",inside_q0,'outside_q0:',outside_q0)
+                self.sub_q = abs(inside_q0 - outside_q0)
+                print("sub_q:",self.sub_q)
+                if abs(inside_q0) <= abs(outside_q0):
+                    s0 = inside_s0
+                    q0 = inside_q0
+                    self.choiced_path = 0
+                else:
+                    s0 = outside_s0
+                    q0 = outside_q0
+                    self.choiced_path = 1
+
+                print(self.choiced_path)
 
                 # 3) 로컬 경로 생성 (Δs는 차량 속도 및 장애물 정보 반영)
                 # 후보 경로들을 생성 (-1.5부터 1.5까지 0.1 단위)
-                candidate_paths_list, cart_candidate_paths_list = self.generate_cadidate_paths(s0, q0)
                 candidate_paths_list, cart_candidate_paths_list = self.generate_cadidate_paths(s0, q0)
 
                 # CandidatePaths 커스텀 메시지에 모든 후보 경로 저장
@@ -117,27 +143,8 @@ class GlobalPathAnalyzer:
                 # 각 후보 경로를 대응하는 publisher를 통해 발행합니다.
                 for pub, path in zip(filtered_publishers, filtered_paths):
                     pub.publish(path)
-                # candidate_path = candidate_paths_msg.paths[6]
-                # print("Candidate Path 6:")
-                # for i, pose in enumerate(candidate_path.poses):
-                #     x = pose.pose.position.x
-                #     y = pose.pose.position.y
-                #     print("Point {}: x = {:.3f}, y = {:.3f}".format(i, x, y))
-
-                # 디버그 출력
-                x_s0 = self.cs_x(s0)
-                y_s0 = self.cs_y(s0)
-                rospy.loginfo("차량 (x,y)=(%.3f, %.3f), yaw=%.3f, speed=%.2f -> s0=%.3f, 경로 좌표=(%.3f, %.3f), q0=%.3f",
-                              self.current_x, self.current_y, self.current_yaw * 180/pi, self.current_speed,
-                              s0, x_s0, y_s0, q0)
-                rospy.loginfo("장애물 좌표 업데이트: %s", self.obstacles_s)
-
-                # debug_msg = Float32MultiArray()
-                # debug_msg.data = [s0, q0]
-                # self.debug_pub.publish(debug_msg)
 
                 self.is_odom_received = False
-                # self.is_global_path_ready = False
                 self.is_status = False
                 self.is_obstacle = False
 
@@ -151,12 +158,48 @@ class GlobalPathAnalyzer:
     # ---------------------------------------------------------
     # 전역 경로 /global_path 콜백
     # ---------------------------------------------------------
-    def global_path_callback(self, msg):
+    def inside_global_path_callback(self, msg):
+        if not msg.poses:
+            rospy.logwarn("수신한 inside_global_path가 비어 있습니다.")
+            return
+
+        if self.is_inside_global_path_ready is False:
+            x_points = []
+            y_points = []
+            for pose_stamped in msg.poses:
+                x_points.append(pose_stamped.pose.position.x)
+                y_points.append(pose_stamped.pose.position.y)
+
+            # 폐곡선 가정: 첫번째와 마지막 좌표가 같도록 보정
+            tol = 1e-8
+            if abs(x_points[0] - x_points[-1]) > tol or abs(y_points[0] - y_points[-1]) > tol:
+                rospy.logwarn("inside_global_path 첫번째와 마지막 좌표가 다릅니다. 강제로 보정합니다.")
+                x_points[-1] = x_points[0]
+                y_points[-1] = y_points[0]
+
+            # 호 길이 s_vals 계산
+            s_vals = [0.0]
+            for i in range(1, len(x_points)):
+                dist = hypot(x_points[i] - x_points[i-1],
+                            y_points[i] - y_points[i-1])
+                s_vals.append(s_vals[-1] + dist)
+
+            self.inside_s_vals = s_vals
+            self.inside_total_length = s_vals[-1]
+
+            # 주기적 스플라인 보간
+            self.inside_cs_x = CubicSpline(self.inside_s_vals, x_points, bc_type='periodic')
+            self.inside_cs_y = CubicSpline(self.inside_s_vals, y_points, bc_type='periodic')
+
+            self.is_inside_global_path_ready = True
+            # rospy.loginfo("글로벌 경로 보간 완료. 전체 길이=%.3f", self.total_length)
+
+    def outside_global_path_callback(self, msg):
         if not msg.poses:
             rospy.logwarn("수신한 global_path가 비어 있습니다.")
             return
 
-        if self.is_global_path_ready is False:
+        if self.is_inside_global_path_ready is False:
             x_points = []
             y_points = []
             for pose_stamped in msg.poses:
@@ -177,15 +220,14 @@ class GlobalPathAnalyzer:
                             y_points[i] - y_points[i-1])
                 s_vals.append(s_vals[-1] + dist)
 
-            self.s_vals = s_vals
-            self.total_length = s_vals[-1]
+            self.outside_s_vals = s_vals
+            self.outside_total_length = s_vals[-1]
 
             # 주기적 스플라인 보간
-            self.cs_x = CubicSpline(self.s_vals, x_points, bc_type='periodic')
-            self.cs_y = CubicSpline(self.s_vals, y_points, bc_type='periodic')
+            self.outside_cs_x = CubicSpline(self.outside_s_vals, x_points, bc_type='periodic')
+            self.outside_cs_y = CubicSpline(self.outside_s_vals, y_points, bc_type='periodic')
 
-            self.is_global_path_ready = True
-            # rospy.loginfo("글로벌 경로 보간 완료. 전체 길이=%.3f", self.total_length)
+            self.is_outside_global_path_ready = True
 
     # ---------------------------------------------------------
     # 오도메트리 /odom 콜백 (위치, 헤딩, 속도 업데이트)
@@ -211,7 +253,7 @@ class GlobalPathAnalyzer:
         self.dynamic_obstacles에 저장합니다.
         각 장애물은 (s, q, v_s, v_q, a_s, a_q) 튜플로 저장됩니다.
         """
-        if not self.is_global_path_ready:
+        if not self.is_inside_global_path_ready and not self.is_outside_global_path_ready:
             rospy.logwarn("전역 경로가 아직 준비되지 않았습니다.")
             return
         self.is_obstacle = True
@@ -226,12 +268,13 @@ class GlobalPathAnalyzer:
             a_x = obstacle.acceleration.x
             a_y = obstacle.acceleration.y
             # Frenet 좌표 및 속도/가속도 변환
-            s_obs, q_obs, v_s, v_q, a_s, a_q = self.compute_obstacle_frenet_all(x_obs, y_obs, v_x, v_y, a_x, a_y)
+            # s_obs, q_obs, v_s, v_q, a_s, a_q = self.compute_obstacle_frenet_all(x_obs, y_obs, v_x, v_y, a_x, a_y)
+            s_obs, q_obs = self.compute_obstacle_frenet_all(x_obs, y_obs, v_x, v_y, a_x, a_y)
             # |q_obs|가 1.5 이하인 경우만 저장
             if abs(q_obs) <= 1.5:
-                dyn_obs.append((s_obs, q_obs, v_s, v_q, a_s, a_q))
+                dyn_obs.append((s_obs, q_obs))
         self.obstacles_s = dyn_obs
-        rospy.loginfo("동적 장애물 업데이트: %s", self.obstacles_s)
+        # rospy.loginfo("동적 장애물 업데이트: %s", self.obstacles_s)
 
     def compute_obstacle_frenet_all(self, x_obs, y_obs, v_x, v_y, a_x, a_y):
         """
@@ -240,114 +283,203 @@ class GlobalPathAnalyzer:
         """
         # 1. 위치 변환: s, q 계산 (기존 방식)
         s_obs = self.compute_s_coordinate(x_obs, y_obs)
-        q_obs = self.signed_lateral_offset(x_obs, y_obs, s_obs)
+        if self.choiced_path == 0:
+            q_obs = self.inside_signed_lateral_offset(x_obs, y_obs, s_obs)
+            # T_x = self.inside_cs_x.derivative()(s_obs)
+            # T_y = self.inside_cs_y.derivative()(s_obs)
+        else:
+            q_obs = self.outside_signed_lateral_offset(x_obs, y_obs, s_obs)
+            # T_x = self.outside_cs_x.derivative()(s_obs)
+            # T_y = self.outside_cs_y.derivative()(s_obs)
 
         # 2. 전역 경로에서 s_obs 위치에서 접선 벡터 T와 법선 벡터 N 계산
         # T = (dx/ds, dy/ds) normalized
-        T_x = self.cs_x.derivative()(s_obs)
-        T_y = self.cs_y.derivative()(s_obs)
-        T_norm = sqrt(T_x**2 + T_y**2)
-        if T_norm < 1e-6:
-            T_norm = 1e-6
-        T_x /= T_norm
-        T_y /= T_norm
+        # T_norm = sqrt(T_x**2 + T_y**2)
+        # if T_norm < 1e-6:
+        #     T_norm = 1e-6
+        # T_x /= T_norm
+        # T_y /= T_norm
 
         # N = (-T_y, T_x) (여기서는 왼쪽이 +q라고 가정)
-        N_x = -T_y
-        N_y = T_x
+        # N_x = -T_y
+        # N_y = T_x
 
         # 3. 전역 속도와 가속도를 Frenet 성분으로 변환
         # 속도: v_s = v · T, v_q = v · N
-        v_s = v_x * T_x + v_y * T_y
-        v_q = v_x * N_x + v_y * N_y
+        # v_s = v_x * T_x + v_y * T_y
+        # v_q = v_x * N_x + v_y * N_y
 
         # 4. 전역 가속도 벡터를 Frenet 성분으로 변환
         # 곡률 kappa = (x'(s)*y''(s) - y'(s)*x''(s)) / ((x'(s)^2 + y'(s)^2)^(3/2))
-        cs_x_prime = self.cs_x.derivative()(s_obs)
-        cs_y_prime = self.cs_y.derivative()(s_obs)
-        cs_x_second = self.cs_x.derivative(2)(s_obs)
-        cs_y_second = self.cs_y.derivative(2)(s_obs)
-        denom = (cs_x_prime**2 + cs_y_prime**2)**1.5
-        if denom < 1e-6:
-            kappa = 0.0
-        else:
-            kappa = (cs_x_prime * cs_y_second - cs_y_prime * cs_x_second) / denom
+        # if self.choiced_path == 0:
+        #     cs_x_prime = self.inside_cs_x.derivative()(s_obs)
+        #     cs_y_prime = self.inside_cs_y.derivative()(s_obs)
+        #     cs_x_second = self.inside_cs_x.derivative(2)(s_obs)
+        #     cs_y_second = self.inside_cs_y.derivative(2)(s_obs)
+        # else:
+        #     cs_x_prime = self.outside_cs_x.derivative()(s_obs)
+        #     cs_y_prime = self.outside_cs_y.derivative()(s_obs)
+        #     cs_x_second = self.outside_cs_x.derivative(2)(s_obs)
+        #     cs_y_second = self.outside_cs_y.derivative(2)(s_obs)
+        # denom = (cs_x_prime**2 + cs_y_prime**2)**1.5
+        # if denom < 1e-6:
+        #     kappa = 0.0
+        # else:
+        #     kappa = (cs_x_prime * cs_y_second - cs_y_prime * cs_x_second) / denom
 
         # Frenet 가속도 공식:
         # a_s = T·a - kappa * v_q^2
         # a_q = N·a + kappa * v_s * v_q
-        a_s = a_x * T_x + a_y * T_y - kappa * (v_q**2)
-        a_q = a_x * N_x + a_y * N_y + kappa * v_s * v_q
+        # a_s = a_x * T_x + a_y * T_y - kappa * (v_q**2)
+        # a_q = a_x * N_x + a_y * N_y + kappa * v_s * v_q
 
-        return s_obs, q_obs, v_s, v_q, a_s, a_q
+        return s_obs, q_obs#, v_s, v_q, a_s, a_q
 
     def compute_s_coordinate(self, x, y):
         """
         주어진 전역 좌표 (x, y)에 대해, 전역 경로 상의 s 값을 벡터화된 방법으로 계산합니다.
         self.s_candidates는 미리 생성되어 있다고 가정합니다.
         """
-        xs = self.cs_x(self.s_candidates)
-        ys = self.cs_y(self.s_candidates)
-        distances = (x - xs)**2 + (y - ys)**2
-        s_best = self.s_candidates[np.argmin(distances)]
+        if self.choiced_path == 0:
+            xs = self.inside_cs_x(self.inside_s_candidates)
+            ys = self.inside_cs_y(self.inside_s_candidates)
+            distances = (x - xs)**2 + (y - ys)**2
+            s_best = self.inside_s_candidates[np.argmin(distances)]
+        else:
+            xs = self.outside_cs_x(self.outside_s_candidates)
+            ys = self.outside_cs_y(self.outside_s_candidates)
+            distances = (x - xs)**2 + (y - ys)**2
+            s_best = self.outside_s_candidates[np.argmin(distances)]
         return s_best
 
     # ---------------------------------------------------------
-    # 1) s0 찾기 (2차 최소화와 뉴튼 방법)
+    # 1) inside path s0 찾기 (2차 최소화와 뉴튼 방법)
     # ---------------------------------------------------------
-    def find_closest_s_newton(self, x0, y0):
-        if not self.is_global_path_ready:
+    def inside_find_closest_s_newton(self, x0, y0):
+        if not self.is_inside_global_path_ready:
             return 0.0
 
-        if self.prev_s is not None:
-            s_current = self.prev_s
-        else:
-            # CubicSpline은 벡터화되어 있어, 한 번에 여러 s 값을 평가할 수 있음
-            xs = self.cs_x(self.s_candidates)
-            ys = self.cs_y(self.s_candidates)
-            distances = (x0 - xs)**2 + (y0 - ys)**2  # 벡터화된 거리 계산
-            s_current = self.s_candidates[np.argmin(distances)]
+        # if self.inside_prev_s is not None:
+        #     s_current = self.inside_prev_s
+        # else:
+        #     # CubicSpline은 벡터화되어 있어, 한 번에 여러 s 값을 평가할 수 있음
+        #     xs = self.inside_cs_x(self.inside_s_candidates)
+        #     ys = self.inside_cs_y(self.inside_s_candidates)
+        #     distances = (x0 - xs)**2 + (y0 - ys)**2  # 벡터화된 거리 계산
+        #     s_current = self.inside_s_candidates[np.argmin(distances)]
+
+        xs = self.inside_cs_x(self.inside_s_candidates)
+        ys = self.inside_cs_y(self.inside_s_candidates)
+        distances = (x0 - xs)**2 + (y0 - ys)**2  # 벡터화된 거리 계산
+        s_current = self.inside_s_candidates[np.argmin(distances)]
 
         max_iter = 30
         tol = 1e-6
         for _ in range(max_iter):
-            fprime = self.dist_sq_grad(s_current, x0, y0)
-            fsecond = self.dist_sq_hess(s_current, x0, y0)
+            fprime = self.inside_dist_sq_grad(s_current, x0, y0)
+            fsecond = self.inside_dist_sq_hess(s_current, x0, y0)
             if abs(fsecond) < 1e-12:
                 break
             step = -fprime / fsecond
             s_current += step
-            s_current = s_current % self.total_length
+            s_current = s_current % self.inside_total_length
             if abs(step) < tol:
                 break
-        self.prev_s = s_current
+
         return s_current
 
-    def dist_sq_grad(self, s, x0, y0):
-        dx = x0 - self.cs_x(s)
-        dy = y0 - self.cs_y(s)
-        dxds = self.cs_x.derivative()(s)
-        dyds = self.cs_y.derivative()(s)
+    def inside_dist_sq_grad(self, s, x0, y0):
+        dx = x0 - self.inside_cs_x(s)
+        dy = y0 - self.inside_cs_y(s)
+        dxds = self.inside_cs_x.derivative()(s)
+        dyds = self.inside_cs_y.derivative()(s)
         return -2.0 * (dx * dxds + dy * dyds)
 
-    def dist_sq_hess(self, s, x0, y0):
-        dx = x0 - self.cs_x(s)
-        dy = y0 - self.cs_y(s)
-        dxds = self.cs_x.derivative()(s)
-        dyds = self.cs_y.derivative()(s)
-        d2xds2 = self.cs_x.derivative(2)(s)
-        d2yds2 = self.cs_y.derivative(2)(s)
+    def inside_dist_sq_hess(self, s, x0, y0):
+        dx = x0 - self.inside_cs_x(s)
+        dy = y0 - self.inside_cs_y(s)
+        dxds = self.inside_cs_x.derivative()(s)
+        dyds = self.inside_cs_y.derivative()(s)
+        d2xds2 = self.inside_cs_x.derivative(2)(s)
+        d2yds2 = self.inside_cs_y.derivative(2)(s)
         val = (-dxds**2 + dx * d2xds2) + (-dyds**2 + dy * d2yds2)
         return -2.0 * val
 
     # ---------------------------------------------------------
     # 2) 현재 횡방향 오프셋 q0
     # ---------------------------------------------------------
-    def signed_lateral_offset(self, x0, y0, s0):
-        px = self.cs_x(s0)
-        py = self.cs_y(s0)
-        tx = self.cs_x.derivative()(s0)
-        ty = self.cs_y.derivative()(s0)
+    def inside_signed_lateral_offset(self, x0, y0, s0):
+        px = self.inside_cs_x(s0)
+        py = self.inside_cs_y(s0)
+        tx = self.inside_cs_x.derivative()(s0)
+        ty = self.inside_cs_y.derivative()(s0)
+        dx_veh = x0 - px
+        dy_veh = y0 - py
+        cross_val = tx * dy_veh - ty * dx_veh
+        q0 = math.sqrt(dx_veh**2 + dy_veh**2)
+        return +q0 if cross_val > 0.0 else -q0
+
+    # ---------------------------------------------------------
+    # 1) outside path s0 찾기 (2차 최소화와 뉴튼 방법)
+    # ---------------------------------------------------------
+
+    def outside_find_closest_s_newton(self, x0, y0):
+        if not self.is_outside_global_path_ready:
+            return 0.0
+
+        # if self.outside_prev_s is not None:
+        #     s_current = self.outside_prev_s
+        # else:
+        #     # CubicSpline은 벡터화되어 있어, 한 번에 여러 s 값을 평가할 수 있음
+        #     xs = self.outside_cs_x(self.outside_s_candidates)
+        #     ys = self.outside_cs_y(self.outside_s_candidates)
+        #     distances = (x0 - xs)**2 + (y0 - ys)**2  # 벡터화된 거리 계산
+        #     s_current = self.outside_s_candidates[np.argmin(distances)]
+        xs = self.outside_cs_x(self.outside_s_candidates)
+        ys = self.outside_cs_y(self.outside_s_candidates)
+        distances = (x0 - xs)**2 + (y0 - ys)**2  # 벡터화된 거리 계산
+        s_current = self.outside_s_candidates[np.argmin(distances)]
+
+        max_iter = 30
+        tol = 1e-6
+        for _ in range(max_iter):
+            fprime = self.outside_dist_sq_grad(s_current, x0, y0)
+            fsecond = self.outside_dist_sq_hess(s_current, x0, y0)
+            if abs(fsecond) < 1e-12:
+                break
+            step = -fprime / fsecond
+            s_current += step
+            s_current = s_current % self.outside_total_length
+            if abs(step) < tol:
+                break
+
+        return s_current
+
+    def outside_dist_sq_grad(self, s, x0, y0):
+        dx = x0 - self.outside_cs_x(s)
+        dy = y0 - self.outside_cs_y(s)
+        dxds = self.outside_cs_x.derivative()(s)
+        dyds = self.outside_cs_y.derivative()(s)
+        return -2.0 * (dx * dxds + dy * dyds)
+
+    def outside_dist_sq_hess(self, s, x0, y0):
+        dx = x0 - self.outside_cs_x(s)
+        dy = y0 - self.outside_cs_y(s)
+        dxds = self.outside_cs_x.derivative()(s)
+        dyds = self.outside_cs_y.derivative()(s)
+        d2xds2 = self.outside_cs_x.derivative(2)(s)
+        d2yds2 = self.outside_cs_y.derivative(2)(s)
+        val = (-dxds**2 + dx * d2xds2) + (-dyds**2 + dy * d2yds2)
+        return -2.0 * val
+
+    # ---------------------------------------------------------
+    # 2) 현재 횡방향 오프셋 q0
+    # ---------------------------------------------------------
+    def outside_signed_lateral_offset(self, x0, y0, s0):
+        px = self.outside_cs_x(s0)
+        py = self.outside_cs_y(s0)
+        tx = self.outside_cs_x.derivative()(s0)
+        ty = self.outside_cs_y.derivative()(s0)
         dx_veh = x0 - px
         dy_veh = y0 - py
         cross_val = tx * dy_veh - ty * dx_veh
@@ -357,7 +489,7 @@ class GlobalPathAnalyzer:
     # ---------------------------------------------------------
     # (C) Δs 결정: 속도 및 장애물 정보를 반영 (식 (6) 및 Algorithm 2)
     # ---------------------------------------------------------
-    def compute_delta_s_vel(self, v, a_min=-8.0, s_min=5.0, s_max=10.0):
+    def compute_delta_s_vel(self, v, a_min=-3.0, s_min=5.0, s_max=10.0):
         """
         논문 식 (6)에 따라 차량 속도 v (m/s), 최소 가속도 a_min,
         최소/최대 호 길이(s_min, s_max)를 고려해 Δs를 계산.
@@ -384,7 +516,7 @@ class GlobalPathAnalyzer:
             return s_vel
         else:
             s_obs = min(dist_candidates)
-            return max(min(s_obs, s_min),5.0)
+            return max(s_obs, s_min)
 
     def normalize_angle(self, angle):
         """
@@ -404,10 +536,22 @@ class GlobalPathAnalyzer:
         """
         candidate_paths = []
         cart_candidate_paths = []
-        for lane_offset in np.arange(-1.5, 1.5 + 0.001, 0.5):
-            path_msg, cart_path_msg = self.generate_local_path(s0, q0, lane_offset)
-            candidate_paths.append(path_msg)
-            cart_candidate_paths.append(cart_path_msg)
+        if self.sub_q <= 0.3:
+            for lane_offset in np.arange(-1.0, 1.0 + 0.001, 0.4):
+                path_msg, cart_path_msg = self.generate_local_path(s0, q0, lane_offset)
+                candidate_paths.append(path_msg)
+                cart_candidate_paths.append(cart_path_msg)
+        else:
+            if self.choiced_path == 0:
+                for lane_offset in np.arange(-2.0, 0 + 0.001, 0.4):
+                    path_msg, cart_path_msg = self.generate_local_path(s0, q0, lane_offset)
+                    candidate_paths.append(path_msg)
+                    cart_candidate_paths.append(cart_path_msg)
+            else:
+                for lane_offset in np.arange(0, 2.0 + 0.001, 0.4):
+                    path_msg, cart_path_msg = self.generate_local_path(s0, q0, lane_offset)
+                    candidate_paths.append(path_msg)
+                    cart_candidate_paths.append(cart_path_msg)
         return candidate_paths, cart_candidate_paths
 
     def generate_local_path(self, s0, q0, lane_offset):
@@ -423,23 +567,19 @@ class GlobalPathAnalyzer:
         cart_path_msg.header.frame_id = "map"
 
         # (a) Δs 결정: 차량 속도와 장애물 정보를 반영하여 Δs를 구함
-        s_vel = self.compute_delta_s_vel(self.current_speed, a_min = -8.0, s_min=5.0)
+        s_vel = self.compute_delta_s_vel(self.current_speed, a_min = -3.0, s_min=5.0)
         final_delta_s = self.compute_delta_s_with_obstacles(s0, s_vel, s_min=5.0)
 
         # (b) 경계 조건:
         # 시작점: q(s0)=q0, q'(s0)=tan(Δθ)
-        path_yaw = math.atan2(self.cs_y.derivative()(s0), self.cs_x.derivative()(s0))
+        if self.choiced_path == 0:
+            path_yaw = math.atan2(self.inside_cs_y.derivative()(s0), self.inside_cs_x.derivative()(s0))
+        else:
+            path_yaw = math.atan2(self.outside_cs_y.derivative()(s0), self.outside_cs_x.derivative()(s0))
         dtheta = self.normalize_angle(self.current_yaw - path_yaw)
         # rospy.loginfo("dtheta = %.3f, path_yaw = %.3f", dtheta * 180/math.pi, path_yaw * 180/math.pi)
         q_i = q0
         dq_i = math.tan(dtheta)
-        # 클램핑: dq_i의 값이 너무 크면 최대/최소값으로 제한
-        # max_dq = 0.1  # 필요에 따라 조정 (예: 1.0 또는 적절한 값)
-        # if dq_i > max_dq:
-        #     dq_i = max_dq
-        # elif dq_i < -max_dq:
-        #     dq_i = -max_dq
-        # 끝점: 원하는 후보 lane_offset 값을 그대로 사용 (즉, q_f = lane_offset)
         q_f = lane_offset
         dq_f = 0.0
 
@@ -453,14 +593,17 @@ class GlobalPathAnalyzer:
         a_, b_, c_, d_ = self.solve_cubic_spline_coeffs(q_i, dq_i, q_f, dq_f, final_delta_s)
 
         # 4) t 구간 샘플링
-        num_samples = 50
+        num_samples = 10
         t_samples = np.linspace(0.0, final_delta_s, num_samples)
 
         for t in t_samples:
             # 4-1) q(t) 계산
             q_val = self.eval_q_spline_t(a_, b_, c_, d_, t)
             # 4-2) 전역 경로 호 길이 s = (s0 + t) % total_length
-            s_val = (s0 + t) % self.total_length
+            if self.choiced_path == 0:
+                s_val = (s0 + t) % self.inside_total_length
+            else:
+                s_val = (s0 + t) % self.outside_total_length
             # print("s_val = %.3f, q_val = %.3f",s_val,q_val)
             # 4-3) Frenet -> Cartesian 변환
             X, Y = self.frenet_to_cartesian(s_val, q_val)
@@ -526,11 +669,18 @@ class GlobalPathAnalyzer:
     # 3-2) Frenet -> Cartesian 변환
     # ---------------------------------------------------------
     def frenet_to_cartesian(self, s, q):
-        px = self.cs_x(s % self.total_length)
-        py = self.cs_y(s % self.total_length)
+        if self.choiced_path == 0:
+            px = self.inside_cs_x(s % self.inside_total_length)
+            py = self.inside_cs_y(s % self.inside_total_length)
 
-        tx = self.cs_x.derivative()(s % self.total_length)
-        ty = self.cs_y.derivative()(s % self.total_length)
+            tx = self.inside_cs_x.derivative()(s % self.inside_total_length)
+            ty = self.inside_cs_y.derivative()(s % self.inside_total_length)
+        else:
+            px = self.outside_cs_x(s % self.outside_total_length)
+            py = self.outside_cs_y(s % self.outside_total_length)
+
+            tx = self.outside_cs_x.derivative()(s % self.outside_total_length)
+            ty = self.outside_cs_y.derivative()(s % self.outside_total_length)
         mag_t = math.hypot(tx, ty)
         if mag_t < 1e-9:
             return px, py
@@ -583,7 +733,7 @@ class GlobalPathAnalyzer:
         w_s = 3.0   # 정적 장애물 비용 가중치 # 경로에서 정적 장애물 회피하려면 최소 w_s : w_sm = 1 : 1 필요
         w_sm = 3.0  # 부드러움 비용 가중치 # 곡선 구간에서 인코스를 방지하려면 최소 w_sm : w_g = 3 : 1 필요
         w_g = 1.0   # 전역 경로 추종 비용 가중치
-        w_d = 0.0   # 동적 장애물 비용 (미구현 상태)
+        w_d = 0.0   # 동적 장애물 비용
 
         # 1) 정적 장애물 비용 (각 후보 경로마다 값이 계산됨)
         set_c_s = self.compute_static_obstacle_cost(
@@ -602,7 +752,7 @@ class GlobalPathAnalyzer:
         set_c_g = self.compute_global_path_cost(candidate_paths)
 
         # 4) 동적 장애물 비용
-        set_c_d = self.compute_dynamic_cost(candidate_paths)
+        # set_c_d = self.compute_dynamic_cost(candidate_paths)
         # set_c_d = []
         # for candidate_path in candidate_paths:
         #     c_d = self.compute_dynamic_cost(candidate_path)
@@ -613,11 +763,10 @@ class GlobalPathAnalyzer:
         for i in range(len(candidate_paths)):
             c_total = (w_s  * set_c_s[i]
                         + w_sm * set_c_sm[i]
-                        + w_g  * set_c_g[i]
-                        + w_d  * set_c_d[i])  # 동적 장애물 비용 미구현이므로 0
+                        + w_g  * set_c_g[i])
+                        # + w_d  * set_c_d[i])  # 동적 장애물 비용 미구현이므로 0
             c_totals.append(c_total)
-            rospy.loginfo("Candidate %d: c_static=%.3f, c_smooth=%.3f, c_global=%.3f, total_cost=%.3f",
-                      i, w_s  * set_c_s[i], w_sm * set_c_sm[i], w_g  * set_c_g[i], c_total)
+            rospy.loginfo("Candidate %d: c_static=%.3f, c_smooth=%.3f, c_global=%.3f, total_cost=%.3f", i, w_s  * set_c_s[i], w_sm * set_c_sm[i], w_g  * set_c_g[i], c_total)
 
         # 5) 최적 경로 선택 (가장 비용이 낮은 인덱스)
         min_idx = np.argmin(c_totals)
@@ -833,8 +982,7 @@ class GlobalPathAnalyzer:
                 cost = abs(a_req) * (s_c - L_follow)
 
             dynamic_costs.append(cost)
-            rospy.loginfo("Candidate: s_c=%.3f, t_veh=%.3f, t_obs=%.3f, Δt=%.3f, cost=%.3f",
-                        s_c, t_veh, t_obs_min, delta_t, cost)
+            # rospy.loginfo("Candidate: s_c=%.3f, t_veh=%.3f, t_obs=%.3f, Δt=%.3f, cost=%.3f", s_c, t_veh, t_obs_min, delta_t, cost)
 
         return dynamic_costs
 
