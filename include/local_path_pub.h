@@ -67,7 +67,11 @@ private:
     // 선택된 경로: 0 for inside, 1 for outside
     int choiced_path_;
 
-    double sub_q_;
+    double sub_q_; // 두 경로간의 q 차이
+
+    double a_min_;
+    double s_min_;
+    double s_max_;
 
     // Odom and status
     bool is_odom_received_;
@@ -107,8 +111,8 @@ private:
     void generateCandidatePaths(double s0, double q0, vector<nav_msgs::Path> &candidate_paths, vector<nav_msgs::Path> &cart_candidate_paths);
     void generateLocalPath(double s0, double q0, double lane_offset, nav_msgs::Path &path_msg, nav_msgs::Path &cart_path_msg);
 
-    double compute_delta_s_vel(double v, double a_min, double s_min, double s_max);
-    double compute_delta_s_with_obstacles(double s_vehicle, double s_vel, double s_min);
+    double compute_delta_s_vel();
+    double compute_delta_s_with_obstacles(double s_vehicle, double s_vel);
     double normalize_angle(double angle);
     void solve_cubic_spline_coeffs(double q_i, double dq_i, double q_f, double dq_f, double ds, double &a_, double &b_, double &c_, double &d_);
     double eval_q_spline_t(double a_, double b_, double c_, double d_, double t);

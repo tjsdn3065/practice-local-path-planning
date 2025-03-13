@@ -11,6 +11,9 @@ GlobalPathAnalyzer::GlobalPathAnalyzer(ros::NodeHandle &nh) : nh_(nh)
     is_obstacle_ = false;
     choiced_path_ = -1;
     sub_q_ = 0;
+    a_min_ = -3.0; // 상황에 따라 수정
+    s_min_ = 10.0; // 상황에 따라 수정
+    s_max_ = 20.0; // 상황에 따라 수정
     current_x_ = current_y_ = current_yaw_ = current_speed_ = 0.0;
 
     // Publishers
@@ -476,30 +479,30 @@ pair<double,double> GlobalPathAnalyzer::compute_obstacle_frenet_all(double x_obs
     return make_pair(s_obs, q_obs);
 }
 
-double GlobalPathAnalyzer::compute_delta_s_vel(double v, double a_min, double s_min, double s_max)
+double GlobalPathAnalyzer::compute_delta_s_vel()
 {
     // a_min은 음수이므로 abs(a_min)
-    double s_candidate = s_min + (v * v / fabs(a_min));
-    if (s_candidate < s_max)
+    double s_candidate = s_min_ + (current_speed_ * current_speed_ / fabs(a_min_));
+    if (s_candidate < s_max_)
         return s_candidate;
     else
-        return s_max;
+        return s_max_;
 }
 
-double GlobalPathAnalyzer::compute_delta_s_with_obstacles(double s_vehicle, double s_vel, double s_min)
+double GlobalPathAnalyzer::compute_delta_s_with_obstacles(double s_vehicle, double s_vel)
 {
     vector<double> dist_candidates;
     for (const auto &obs : obstacles_s_) { // obstacles_s_: vector of pair<double, double> (s,q)
         double s_obs = obs.first;
         double dist = s_obs - s_vehicle;
-        if (dist > 0 && dist < 10)
+        if (dist > 0 && dist < 20)
             dist_candidates.push_back(dist);
     }
     if (dist_candidates.empty())
         return s_vel;
     else {
         double s_obs = *min_element(dist_candidates.begin(), dist_candidates.end());
-        return max(s_obs, s_min);
+        return max(s_obs, s_min_);
     }
 }
 
@@ -521,7 +524,7 @@ void GlobalPathAnalyzer::generateCandidatePaths(double s0, double q0,
 
     // sub_q: 두 전역 경로 간 q 차이 (멤버 변수)
     if (sub_q_ <= 0.3) {
-        for (double lane_offset = -1.0; lane_offset <= 1.0 + 1e-3; lane_offset += 0.4) {
+        for (double lane_offset = -1.5; lane_offset <= 1.5 + 1e-3; lane_offset += 0.5) {
             nav_msgs::Path path_msg, cart_path_msg;
             generateLocalPath(s0, q0, lane_offset, path_msg, cart_path_msg);
             candidate_paths.push_back(path_msg);
@@ -530,7 +533,7 @@ void GlobalPathAnalyzer::generateCandidatePaths(double s0, double q0,
     }
     else {
         if (choiced_path_ == 0) {
-            for (double lane_offset = -2.0; lane_offset <= 0.0 + 1e-3; lane_offset += 0.4) {
+            for (double lane_offset = -2.0; lane_offset <= 0.4 + 1e-3; lane_offset += 0.4) {
                 nav_msgs::Path path_msg, cart_path_msg;
                 generateLocalPath(s0, q0, lane_offset, path_msg, cart_path_msg);
                 candidate_paths.push_back(path_msg);
@@ -538,7 +541,7 @@ void GlobalPathAnalyzer::generateCandidatePaths(double s0, double q0,
             }
         }
         else {
-            for (double lane_offset = 0.0; lane_offset <= 2.0 + 1e-3; lane_offset += 0.4) {
+            for (double lane_offset = -0.4; lane_offset <= 2.0 + 1e-3; lane_offset += 0.4) {
                 nav_msgs::Path path_msg, cart_path_msg;
                 generateLocalPath(s0, q0, lane_offset, path_msg, cart_path_msg);
                 candidate_paths.push_back(path_msg);
@@ -554,8 +557,8 @@ void GlobalPathAnalyzer::generateLocalPath(double s0, double q0, double lane_off
     path_msg.header.frame_id = "map";
     cart_path_msg.header.frame_id = "map";
 
-    double s_vel = compute_delta_s_vel(current_speed_, -3.0, 5.0, 10.0);
-    double final_delta_s = compute_delta_s_with_obstacles(s0, s_vel, 5.0);
+    double s_vel = compute_delta_s_vel();
+    double final_delta_s = compute_delta_s_with_obstacles(s0, s_vel);
 
     double dxds,dyds;
     double h = 1e-4;
@@ -580,7 +583,7 @@ void GlobalPathAnalyzer::generateLocalPath(double s0, double q0, double lane_off
     solve_cubic_spline_coeffs(q_i, dq_i, q_f, dq_f, final_delta_s, a_, b_, c_, d_);
 
     // t 구간 샘플링 (예: 10개의 샘플)
-    int num_samples = 10;
+    int num_samples = 20;
     vector<double> t_samples(num_samples);
     double dt = final_delta_s / (num_samples - 1);
     for (int i = 0; i < num_samples; i++) {
