@@ -9,14 +9,29 @@ GlobalPathAnalyzer::GlobalPathAnalyzer(ros::NodeHandle &nh) : nh_(nh)
     is_odom_received_ = false;
     is_status_ = false;
     is_obstacle_ = false;
+
     choiced_path_ = -1;
+
+    num_samples_ = 3000;    // 상황에 따라 수정
+
+    inside_s0_ = 0.0;
+    inside_q0_ = 0.0;
+
+    outside_s0_ = 0.0;
+    outside_q0_ = 0.0;
+
+    s0_ = q0_ = 0.0;
+
     sub_q_ = 0;
-    a_min_ = -3.0; // 상황에 따라 수정
-    s_min_ = 10.0; // 상황에 따라 수정
-    s_max_ = 20.0; // 상황에 따라 수정
+
+    a_min_ = -3.0;    // 상황에 따라 수정
+    s_min_ = 10.0;    // 상황에 따라 수정
+    s_max_ = 20.0;    // 상황에 따라 수정
+
     future_inside_s0_ = 0;
     future_outside_s0_ = 0;
     future_in_X_ = future_in_Y_ = future_out_X_ = future_out_Y_ = 0;
+
     current_x_ = current_y_ = current_yaw_ = current_speed_ = 0.0;
 
     // Publishers
@@ -51,58 +66,57 @@ void GlobalPathAnalyzer::spin()
             // inside_s_candidates 및 outside_s_candidates 초기화 (if empty)
             if (inside_s_candidates_.empty())
             {
-                int num_samples = 3000;
-                inside_s_candidates_.resize(num_samples);
-                double step = inside_total_length_ / (num_samples - 1);
-                for (int i = 0; i < num_samples; i++)
+                double step;
+                inside_s_candidates_.resize(num_samples_);
+                step = inside_total_length_ / (num_samples_ - 1);
+                for (int i = 0; i < num_samples_; i++)
                     inside_s_candidates_[i] = i * step;
             }
             if (outside_s_candidates_.empty())
             {
-                int num_samples = 3000;
-                outside_s_candidates_.resize(num_samples);
-                double step = outside_total_length_ / (num_samples - 1);
-                for (int i = 0; i < num_samples; i++)
+                double step;
+                outside_s_candidates_.resize(num_samples_);
+                step = outside_total_length_ / (num_samples_ - 1);
+                for (int i = 0; i < num_samples_; i++)
                     outside_s_candidates_[i] = i * step;
             }
 
-            double inside_s0 = insideFindClosestSNewton(current_x_, current_y_);
-            double outside_s0 = outsideFindClosestSNewton(current_x_, current_y_);
-            double inside_q0 = insideSignedLateralOffset(current_x_, current_y_, inside_s0);
-            double outside_q0 = outsideSignedLateralOffset(current_x_, current_y_, outside_s0);
+            inside_s0_ = insideFindClosestSNewton(current_x_, current_y_);
+            outside_s0_ = outsideFindClosestSNewton(current_x_, current_y_);
+            inside_q0_ = insideSignedLateralOffset(current_x_, current_y_, inside_s0_);
+            outside_q0_ = outsideSignedLateralOffset(current_x_, current_y_, outside_s0_);
 
-            future_inside_s0_ = fmod(inside_s0 + 20.0, inside_total_length_);
-            future_outside_s0_ = fmod(outside_s0 + 20.0, outside_total_length_);
+            future_inside_s0_ = fmod(inside_s0_ + 20.0, inside_total_length_);
+            future_outside_s0_ = fmod(outside_s0_ + 20.0, outside_total_length_);
             // Cartesian 변환
             frenetToCartesian(future_inside_s0_, 0, future_in_X_, future_in_Y_);
             frenetToCartesian(future_outside_s0_, 0, future_out_X_, future_out_Y_);
 
-            ROS_INFO("inside_q0: %.3f, outside_q0: %.3f", inside_q0, outside_q0);
-            sub_q_ = fabs(inside_q0 - outside_q0);
+            ROS_INFO("inside_q0: %.3f, outside_q0: %.3f", inside_q0_, outside_q0_);
+            sub_q_ = fabs(inside_q0_ - outside_q0_);
             ROS_INFO("sub_q: %.3f", sub_q_);
 
-            double s0, q0;
-            if (fabs(inside_q0) <= fabs(outside_q0))
+            if (fabs(inside_q0_) <= fabs(outside_q0_))
             {
-                s0 = inside_s0;
-                q0 = inside_q0;
+                s0_ = inside_s0_;
+                q0_ = inside_q0_;
                 choiced_path_ = 0;
-                future_inside_s0_ = fmod(inside_s0 + 20.0, inside_total_length_);
-                future_outside_s0_ = fmod(outside_s0 + 20.0, outside_total_length_);
+                future_inside_s0_ = fmod(inside_s0_ + 20.0, inside_total_length_);
             }
             else
             {
-                s0 = outside_s0;
-                q0 = outside_q0;
+                s0_ = outside_s0_;
+                q0_ = outside_q0_;
                 choiced_path_ = 1;
+                future_outside_s0_ = fmod(outside_s0_ + 20.0, outside_total_length_);
             }
             ROS_INFO("Choiced path: %d", choiced_path_);
-            ROS_INFO("s0: %.3f, q0: %.3f", s0, q0);
+            ROS_INFO("s0: %.3f, q0: %.3f", s0_, q0_);
 
             // Candidate paths generation (구현은 별도; 여기서는 placeholder)
             vector<nav_msgs::Path> candidate_paths_list;
             vector<nav_msgs::Path> cart_candidate_paths_list;
-            generateCandidatePaths(s0, q0, candidate_paths_list, cart_candidate_paths_list);
+            generateCandidatePaths(s0_, q0_, candidate_paths_list, cart_candidate_paths_list);
 
             // Create CandidatePaths message
             morai_msgs::CandidatePaths candidate_paths_msg;
@@ -264,7 +278,6 @@ void GlobalPathAnalyzer::statusCallback(const morai_msgs::EgoVehicleStatus::Cons
 }
 
 // -------------------- Utility Functions --------------------
-
 // For inside path
 double GlobalPathAnalyzer::insideFindClosestSNewton(double x0, double y0)
 {
@@ -396,8 +409,8 @@ double GlobalPathAnalyzer::outsideSignedLateralOffset(double x0, double y0, doub
 {
     double x_s0 = outside_cs_x_(s0);
     double y_s0 = outside_cs_y_(s0);
-    double dxds = outside_cs_x_.deriv(1, s);
-    double dyds = outside_cs_y_.deriv(1, s);
+    double dxds = outside_cs_x_.deriv(1, s0);
+    double dyds = outside_cs_y_.deriv(1, s0);
     double dx_veh = x0 - x_s0;
     double dy_veh = y0 - y_s0;
     double cross_val = dxds * dy_veh - dyds * dx_veh;
@@ -405,83 +418,54 @@ double GlobalPathAnalyzer::outsideSignedLateralOffset(double x0, double y0, doub
     return (cross_val > 0) ? q0 : -q0;
 }
 
-double GlobalPathAnalyzer::computeSCoordinate(double x, double y)
-{
-    // pathChoice: 0 -> inside, 1 -> outside
-    vector<double> xs, ys;
-    vector<double> s_candidates;
-    if (choiced_path_ == 0) {
-        xs.resize(inside_s_candidates_.size());
-        ys.resize(inside_s_candidates_.size());
-        s_candidates = inside_s_candidates_;
-        for (size_t i = 0; i < inside_s_candidates_.size(); i++) {
-            xs[i] = inside_cs_x_(inside_s_candidates_[i]);
-            ys[i] = inside_cs_y_(inside_s_candidates_[i]);
-        }
-    } else {
-        xs.resize(outside_s_candidates_.size());
-        ys.resize(outside_s_candidates_.size());
-        s_candidates = outside_s_candidates_;
-        for (size_t i = 0; i < outside_s_candidates_.size(); i++) {
-            xs[i] = outside_cs_x_(outside_s_candidates_[i]);
-            ys[i] = outside_cs_y_(outside_s_candidates_[i]);
-        }
-    }
-    double min_dist = 1e12;
-    double s_best = 0.0;
-    for (size_t i = 0; i < s_candidates.size(); i++) {
-        double d = pow(x - xs[i], 2) + pow(y - ys[i], 2);
-        if (d < min_dist) {
-            min_dist = d;
-            s_best = s_candidates[i];
-        }
-    }
-    return s_best;
-}
-
 // Frenet -> Cartesian conversion
 void GlobalPathAnalyzer::frenetToCartesian(double s, double q, double &X, double &Y)
 {
-    double dx, dy, dxds, dyds;
+    double x_s, y_s, dxds, dyds;
     // Compute tangent using central difference:
-    double h = 1e-4;
     if (choiced_path_ == 0) {
-        dx = inside_cs_x_(fmod(s, inside_total_length_));
-        dy = inside_cs_y_(fmod(s, inside_total_length_));
-        dxds = (inside_cs_x_(s+h) - inside_cs_x_(s-h)) / (2*h);
-        dyds = (inside_cs_y_(s+h) - inside_cs_y_(s-h)) / (2*h);
+        x_s = inside_cs_x_(s);
+        y_s = inside_cs_y_(s);
+        dxds = inside_cs_x_.deriv(1, s);
+        dyds = inside_cs_y_.deriv(1, s);
     } else {
-        dx = outside_cs_x_(fmod(s, outside_total_length_));
-        dy = outside_cs_y_(fmod(s, outside_total_length_));
-        dxds = (outside_cs_x_(s+h) - outside_cs_x_(s-h)) / (2*h);
-        dyds = (outside_cs_y_(s+h) - outside_cs_y_(s-h)) / (2*h);
+        x_s = outside_cs_x_(s);
+        y_s = outside_cs_y_(s);
+        dxds = outside_cs_x_.deriv(1, s);
+        dyds = outside_cs_y_.deriv(1, s);
     }
     double normT = hypot(dxds, dyds);
     if (normT < 1e-9)
     {
-        X = dx;
-        Y = dy;
+        X = x_s;
+        Y = y_s;
         return;
     }
+    // 접선 벡터를 정규화하여 단위벡터로 만듬
     dxds /= normT;
     dyds /= normT;
     // 법선 벡터: (-dyds, dxds)
     double nx = -dyds;
     double ny = dxds;
-    X = dx + q * nx;
-    Y = dy + q * ny;
+    X = x_s + q * nx;
+    Y = y_s + q * ny;
 }
 
-// -------------------- Obstacle Frenet Conversion --------------------
-pair<double,double> GlobalPathAnalyzer::compute_obstacle_frenet_all(double x_obs, double y_obs)
+pair<double,double> GlobalPathAnalyzer::compute_obstacle_frenet_all(double obs_x0, double obs_y0)
 {
-    double s_obs = computeSCoordinate(x_obs, y_obs);
-    double q_obs;
+    double obs_s0;
+    double obs_q0;
     if (choiced_path_ == 0)
-        q_obs = insideSignedLateralOffset(x_obs, y_obs, s_obs);
+    {
+        obs_s0 = insideFindClosestSNewton(obs_x0, obs_y0);
+        obs_q0 = insideSignedLateralOffset(obs_x0, obs_y0, obs_s0);
+    }
     else
-        q_obs = outsideSignedLateralOffset(x_obs, y_obs, s_obs);
-    return make_pair(s_obs, q_obs);
+    {
+        obs_s0 = outsideFindClosestSNewton(obs_x0, obs_y0);
+        obs_q0 = outsideSignedLateralOffset(obs_x0, obs_y0, obs_s0);
+    }
+    return make_pair(obs_s0, obs_q0);
 }
 
 double GlobalPathAnalyzer::compute_delta_s_vel()
@@ -494,20 +478,20 @@ double GlobalPathAnalyzer::compute_delta_s_vel()
         return s_max_;
 }
 
-double GlobalPathAnalyzer::compute_delta_s_with_obstacles(double s_vehicle, double s_vel)
+double GlobalPathAnalyzer::compute_delta_s_with_obstacles(double s0, double delta_s)
 {
     vector<double> dist_candidates;
     for (const auto &obs : obstacles_s_) { // obstacles_s_: vector of pair<double, double> (s,q)
-        double s_obs = obs.first;
-        double dist = s_obs - s_vehicle;
+        double obs_s0 = obs.first;
+        double dist = obs_s0 - s0;
         if (dist > 0 && dist < 20)
             dist_candidates.push_back(dist);
     }
     if (dist_candidates.empty())
-        return s_vel;
+        return delta_s;
     else {
-        double s_obs = *min_element(dist_candidates.begin(), dist_candidates.end());
-        return max(s_obs, s_min_);
+        double obs_s0 = *min_element(dist_candidates.begin(), dist_candidates.end());
+        return max(obs_s0, s_min_);
     }
 }
 
@@ -568,19 +552,18 @@ void GlobalPathAnalyzer::generateLocalPath(double s0, double q0, double lane_off
     path_msg.header.frame_id = "map";
     cart_path_msg.header.frame_id = "map";
 
-    double s_vel = compute_delta_s_vel();
-    double final_delta_s = compute_delta_s_with_obstacles(s0, s_vel);
+    double delta_s = compute_delta_s_vel();
+    double final_delta_s = compute_delta_s_with_obstacles(s0, delta_s);
 
     double dxds,dyds;
-    double h = 1e-4;
     double path_yaw;
     if (choiced_path_ == 0) {
-        dxds = (inside_cs_x_(s0+h) - inside_cs_x_(s0-h)) / (2*h);
-        dyds = (inside_cs_y_(s0+h) - inside_cs_y_(s0-h)) / (2*h);
+        dxds = inside_cs_x_.deriv(1, s0);
+        dyds = inside_cs_y_.deriv(1, s0);
         path_yaw = atan2(dyds, dxds);
     } else {
-        dxds = (outside_cs_x_(s0+h) - outside_cs_x_(s0-h)) / (2*h);
-        dyds = (outside_cs_y_(s0+h) - outside_cs_y_(s0-h)) / (2*h);
+        dxds = outside_cs_x_.deriv(1, s0);
+        dyds = outside_cs_y_.deriv(1, s0);
         path_yaw = atan2(dyds, dxds);
     }
     double dtheta = normalize_angle(current_yaw_ - path_yaw);
@@ -590,8 +573,8 @@ void GlobalPathAnalyzer::generateLocalPath(double s0, double q0, double lane_off
     double dq_f = 0.0;
 
     // 3차 스플라인 계수 계산: solve_cubic_spline_coeffs()를 호출하여 a, b, c, d 결정
-    double a_, b_, c_, d_;
-    solve_cubic_spline_coeffs(q_i, dq_i, q_f, dq_f, final_delta_s, a_, b_, c_, d_);
+    double a, b, c, d;
+    solve_cubic_spline_coeffs(q_i, dq_i, q_f, dq_f, final_delta_s, a, b, c, d);
 
     // t 구간 샘플링 (예: 10개의 샘플)
     int num_samples = 20;
@@ -602,7 +585,7 @@ void GlobalPathAnalyzer::generateLocalPath(double s0, double q0, double lane_off
     }
 
     for (double t : t_samples) {
-        double q_val = eval_q_spline_t(a_, b_, c_, d_, t);
+        double q_val = eval_q_spline_t(a, b, c, d, t);
         double s_val;
         if (choiced_path_ == 0)
             s_val = fmod(s0 + t, inside_total_length_);
@@ -629,10 +612,10 @@ void GlobalPathAnalyzer::generateLocalPath(double s0, double q0, double lane_off
 }
 
 void GlobalPathAnalyzer::solve_cubic_spline_coeffs(double q_i, double dq_i, double q_f, double dq_f, double ds,
-  double &a_, double &b_, double &c_, double &d_)
+  double &a, double &b, double &c, double &d)
 {
-    d_ = q_i;     // q(0) = q_i
-    c_ = dq_i;    // q'(0) = dq_i
+    d = q_i;     // q(0) = q_i
+    c = dq_i;    // q'(0) = dq_i
     double X_f = ds;
     // 2x2 선형 시스템:
     // a_*X_f^3 + b_*X_f^2 = q_f - (c_*X_f + d_)
@@ -641,16 +624,16 @@ void GlobalPathAnalyzer::solve_cubic_spline_coeffs(double q_i, double dq_i, doub
     double A12 = X_f * X_f;
     double A21 = 3 * X_f * X_f;
     double A22 = 2 * X_f;
-    double B1 = q_f - (c_ * X_f + d_);
-    double B2 = dq_f - c_;
+    double B1 = q_f - (c * X_f + d);
+    double B2 = dq_f - c;
     double det = A11 * A22 - A12 * A21;
-    a_ = (B1 * A22 - A12 * B2) / det;
-    b_ = (A11 * B2 - B1 * A21) / det;
+    a = (B1 * A22 - A12 * B2) / det;
+    b = (A11 * B2 - B1 * A21) / det;
 }
 
-double GlobalPathAnalyzer::eval_q_spline_t(double a_, double b_, double c_, double d_, double t)
+double GlobalPathAnalyzer::eval_q_spline_t(double a, double b, double c, double d, double t)
 {
-    return a_ * pow(t, 3) + b_ * pow(t, 2) + c_ * t + d_;
+    return a * pow(t, 3) + b * pow(t, 2) + c * t + d;
 }
 
 nav_msgs::Path GlobalPathAnalyzer::convert_frenet_path_to_cartesian(const nav_msgs::Path &frenet_path)
