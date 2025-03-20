@@ -876,10 +876,7 @@ std::vector<double> GlobalPathAnalyzer::computeDynamicCost(const std::vector<nav
             // Follow 시나리오
             double L_follow = (L0 <= s_c) ? L0 : s_c;
             double delta_follow = s_c - L_follow - v_veh * t_obs_min;
-            if (delta_follow <= 0)
-                a_req = 0.0;
-            else
-                a_req = 2.0 * delta_follow / (t_obs_min * t_obs_min);
+            a_req = 2.0 * delta_follow / (t_obs_min * t_obs_min);
             cost = fabs(a_req) * (s_c - L_follow);
         }
         dynamic_costs.push_back(cost);
