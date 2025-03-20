@@ -48,6 +48,15 @@ private:
     ros::Subscriber obstacle_sub_;
     ros::Subscriber status_sub_;
 
+    int num_samples_;
+
+    double inside_s0_;
+    double outside_s0_;
+    double inside_q0_;
+    double outside_q0_;
+
+    double s0_, q0_;
+
     // Global path (inside)
     bool is_inside_global_path_ready_;
     vector<double> inside_s_vals_;
@@ -72,6 +81,13 @@ private:
     double a_min_;
     double s_min_;
     double s_max_;
+
+    double future_inside_s0_;
+    double future_outside_s0_;
+    double future_in_X_;
+    double future_in_Y_;
+    double future_out_X_;
+    double future_out_Y_;
 
     // Odom and status
     bool is_odom_received_;
@@ -101,9 +117,7 @@ private:
     double outsideDistSqHess(double s, double x0, double y0);
     double outsideSignedLateralOffset(double x0, double y0, double s0);
 
-    // compute_s_coordinate (uses precomputed s_candidates)
-    double computeSCoordinate(double x, double y); // 0 for inside, 1 for outside
-    std::pair<double, double> compute_obstacle_frenet_all(double x_obs, double y_obs);
+    std::pair<double, double> compute_obstacle_frenet_all(double obs_x0, double obs_y0);
 
     // Frenet -> Cartesian conversion
     void frenetToCartesian(double s, double q, double &X, double &Y);
@@ -112,10 +126,10 @@ private:
     void generateLocalPath(double s0, double q0, double lane_offset, nav_msgs::Path &path_msg, nav_msgs::Path &cart_path_msg);
 
     double compute_delta_s_vel();
-    double compute_delta_s_with_obstacles(double s_vehicle, double s_vel);
+    double compute_delta_s_with_obstacles(double s0, double delta_s);
     double normalize_angle(double angle);
-    void solve_cubic_spline_coeffs(double q_i, double dq_i, double q_f, double dq_f, double ds, double &a_, double &b_, double &c_, double &d_);
-    double eval_q_spline_t(double a_, double b_, double c_, double d_, double t);
+    void solve_cubic_spline_coeffs(double q_i, double dq_i, double q_f, double dq_f, double ds, double &a, double &b, double &c, double &d);
+    double eval_q_spline_t(double a, double b, double c, double d, double t);
     nav_msgs::Path convert_frenet_path_to_cartesian(const nav_msgs::Path &frenet_path);
 
     std::pair<nav_msgs::Path, int> computeOptimalPath(const std::vector<nav_msgs::Path>& candidate_paths);
