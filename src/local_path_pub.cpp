@@ -14,6 +14,9 @@ GlobalPathAnalyzer::GlobalPathAnalyzer(ros::NodeHandle &nh) : nh_(nh)
     a_min_ = -3.0; // 상황에 따라 수정
     s_min_ = 10.0; // 상황에 따라 수정
     s_max_ = 20.0; // 상황에 따라 수정
+    future_inside_s0_ = 0;
+    future_outside_s0_ = 0;
+    future_in_X_ = future_in_Y_ = future_out_X_ = future_out_Y_ = 0;
     current_x_ = current_y_ = current_yaw_ = current_speed_ = 0.0;
 
     // Publishers
@@ -68,6 +71,12 @@ void GlobalPathAnalyzer::spin()
             double inside_q0 = insideSignedLateralOffset(current_x_, current_y_, inside_s0);
             double outside_q0 = outsideSignedLateralOffset(current_x_, current_y_, outside_s0);
 
+            future_inside_s0_ = fmod(inside_s0 + 20.0, inside_total_length_);
+            future_outside_s0_ = fmod(outside_s0 + 20.0, outside_total_length_);
+            // Cartesian 변환
+            frenetToCartesian(future_inside_s0_, 0, future_in_X_, future_in_Y_);
+            frenetToCartesian(future_outside_s0_, 0, future_out_X_, future_out_Y_);
+
             ROS_INFO("inside_q0: %.3f, outside_q0: %.3f", inside_q0, outside_q0);
             sub_q_ = fabs(inside_q0 - outside_q0);
             ROS_INFO("sub_q: %.3f", sub_q_);
@@ -78,6 +87,8 @@ void GlobalPathAnalyzer::spin()
                 s0 = inside_s0;
                 q0 = inside_q0;
                 choiced_path_ = 0;
+                future_inside_s0_ = fmod(inside_s0 + 20.0, inside_total_length_);
+                future_outside_s0_ = fmod(outside_s0 + 20.0, outside_total_length_);
             }
             else
             {
@@ -154,6 +165,7 @@ void GlobalPathAnalyzer::insideGlobalPathCallback(const nav_msgs::Path::ConstPtr
         double tol = 1e-8;
         if (fabs(x_points.front() - x_points.back()) > tol || fabs(y_points.front() - y_points.back()) > tol)
         {
+            // 폐구간 보정
             ROS_WARN("inside_global_path first and last points differ; forcing correction.");
             x_points.back() = x_points.front();
             y_points.back() = y_points.front();
@@ -167,7 +179,7 @@ void GlobalPathAnalyzer::insideGlobalPathCallback(const nav_msgs::Path::ConstPtr
         }
         inside_total_length_ = inside_s_vals_.back();
         // Create splines using tk::spline
-        inside_cs_x_.set_points(inside_s_vals_, x_points); // periodic boundary can be handled externally if needed
+        inside_cs_x_.set_points(inside_s_vals_, x_points);
         inside_cs_y_.set_points(inside_s_vals_, y_points);
         is_inside_global_path_ready_ = true;
     }
@@ -265,7 +277,7 @@ double GlobalPathAnalyzer::insideFindClosestSNewton(double x0, double y0)
         double s_val = inside_s_candidates_[i];
         double dx = x0 - inside_cs_x_(s_val);
         double dy = y0 - inside_cs_y_(s_val);
-        double d = dx*dx + dy*dy;
+        double d = dx*dx + dy*dy;    // 실제 거리를 최소화 하는 것과, 제곱된 거리를 최소화 하는 것은 같은 최솟값의 위치를 준다.
         if (d < min_dist) {
             min_dist = d;
             s_current = s_val;
@@ -273,9 +285,9 @@ double GlobalPathAnalyzer::insideFindClosestSNewton(double x0, double y0)
     }
     int max_iter = 30;
     double tol = 1e-6;
-    double h = 1e-4;
     for (int iter = 0; iter < max_iter; iter++)
     {
+        // f(x)는 거리 제곱 함수
         double fprime = insideDistSqGrad(s_current, x0, y0);
         double fsecond = insideDistSqHess(s_current, x0, y0);
         if (fabs(fsecond) < 1e-12)
@@ -292,36 +304,33 @@ double GlobalPathAnalyzer::insideFindClosestSNewton(double x0, double y0)
 
 double GlobalPathAnalyzer::insideDistSqGrad(double s, double x0, double y0)
 {
-    double h = 1e-4;
     double dx = x0 - inside_cs_x_(s);
     double dy = y0 - inside_cs_y_(s);
-    double dxds = (inside_cs_x_(s+h) - inside_cs_x_(s-h)) / (2*h);
-    double dyds = (inside_cs_y_(s+h) - inside_cs_y_(s-h)) / (2*h);
+    double dxds = inside_cs_x_.deriv(1, s);
+    double dyds = inside_cs_y_.deriv(1, s);
     return -2.0 * (dx * dxds + dy * dyds);
 }
 
 double GlobalPathAnalyzer::insideDistSqHess(double s, double x0, double y0)
 {
-    double h = 1e-4;
     double dx = x0 - inside_cs_x_(s);
     double dy = y0 - inside_cs_y_(s);
-    double dxds = (inside_cs_x_(s+h) - inside_cs_x_(s-h)) / (2*h);
-    double dyds = (inside_cs_y_(s+h) - inside_cs_y_(s-h)) / (2*h);
-    double d2xds2 = (inside_cs_x_(s+h) - 2*inside_cs_x_(s) + inside_cs_x_(s-h)) / (h*h);
-    double d2yds2 = (inside_cs_y_(s+h) - 2*inside_cs_y_(s) + inside_cs_y_(s-h)) / (h*h);
+    double dxds = inside_cs_x_.deriv(1, s);
+    double dyds = inside_cs_y_.deriv(1, s);
+    double d2xds2 = inside_cs_x_.deriv(2, s);
+    double d2yds2 = inside_cs_y_.deriv(2, s);
     double val = (-dxds*dxds + dx * d2xds2) + (-dyds*dyds + dy * d2yds2);
     return -2.0 * val;
 }
 
 double GlobalPathAnalyzer::insideSignedLateralOffset(double x0, double y0, double s0)
 {
-    double h = 1e-4;
-    double dx = inside_cs_x_(s0);
-    double dy = inside_cs_y_(s0);
-    double dxds = (inside_cs_x_(s0+h) - inside_cs_x_(s0-h)) / (2*h);
-    double dyds = (inside_cs_y_(s0+h) - inside_cs_y_(s0-h)) / (2*h);
-    double dx_veh = x0 - dx;
-    double dy_veh = y0 - dy;
+    double x_s0 = inside_cs_x_(s0);
+    double y_s0 = inside_cs_y_(s0);
+    double dxds = inside_cs_x_.deriv(1, s0);
+    double dyds = inside_cs_y_.deriv(1, s0);
+    double dx_veh = x0 - x_s0;
+    double dy_veh = y0 - y_s0;
     double cross_val = dxds * dy_veh - dyds * dx_veh;
     double q0 = sqrt(dx_veh*dx_veh + dy_veh*dy_veh);
     return (cross_val > 0) ? q0 : -q0;
@@ -346,7 +355,6 @@ double GlobalPathAnalyzer::outsideFindClosestSNewton(double x0, double y0)
     }
     int max_iter = 30;
     double tol = 1e-6;
-    double h = 1e-4;
     for (int iter = 0; iter < max_iter; iter++)
     {
         double fprime = outsideDistSqGrad(s_current, x0, y0);
@@ -365,36 +373,33 @@ double GlobalPathAnalyzer::outsideFindClosestSNewton(double x0, double y0)
 
 double GlobalPathAnalyzer::outsideDistSqGrad(double s, double x0, double y0)
 {
-    double h = 1e-4;
     double dx = x0 - outside_cs_x_(s);
     double dy = y0 - outside_cs_y_(s);
-    double dxds = (outside_cs_x_(s+h) - outside_cs_x_(s-h)) / (2*h);
-    double dyds = (outside_cs_y_(s+h) - outside_cs_y_(s-h)) / (2*h);
+    double dxds = outside_cs_x_.deriv(1, s);
+    double dyds = outside_cs_y_.deriv(1, s);
     return -2.0 * (dx * dxds + dy * dyds);
 }
 
 double GlobalPathAnalyzer::outsideDistSqHess(double s, double x0, double y0)
 {
-    double h = 1e-4;
     double dx = x0 - outside_cs_x_(s);
     double dy = y0 - outside_cs_y_(s);
-    double dxds = (outside_cs_x_(s+h) - outside_cs_x_(s-h)) / (2*h);
-    double dyds = (outside_cs_y_(s+h) - outside_cs_y_(s-h)) / (2*h);
-    double d2xds2 = (outside_cs_x_(s+h) - 2*outside_cs_x_(s) + outside_cs_x_(s-h)) / (h*h);
-    double d2yds2 = (outside_cs_y_(s+h) - 2*outside_cs_y_(s) + outside_cs_y_(s-h)) / (h*h);
+    double dxds = outside_cs_x_.deriv(1, s);
+    double dyds = outside_cs_y_.deriv(1, s);
+    double d2xds2 = outside_cs_x_.deriv(2, s);
+    double d2yds2 = outside_cs_y_.deriv(2, s);
     double val = (-dxds*dxds + dx * d2xds2) + (-dyds*dyds + dy * d2yds2);
     return -2.0 * val;
 }
 
 double GlobalPathAnalyzer::outsideSignedLateralOffset(double x0, double y0, double s0)
 {
-    double h = 1e-4;
-    double dx = outside_cs_x_(s0);
-    double dy = outside_cs_y_(s0);
-    double dxds = (outside_cs_x_(s0+h) - outside_cs_x_(s0-h)) / (2*h);
-    double dyds = (outside_cs_y_(s0+h) - outside_cs_y_(s0-h)) / (2*h);
-    double dx_veh = x0 - dx;
-    double dy_veh = y0 - dy;
+    double x_s0 = outside_cs_x_(s0);
+    double y_s0 = outside_cs_y_(s0);
+    double dxds = outside_cs_x_.deriv(1, s);
+    double dyds = outside_cs_y_.deriv(1, s);
+    double dx_veh = x0 - x_s0;
+    double dy_veh = y0 - y_s0;
     double cross_val = dxds * dy_veh - dyds * dx_veh;
     double q0 = sqrt(dx_veh*dx_veh + dy_veh*dy_veh);
     return (cross_val > 0) ? q0 : -q0;
@@ -521,6 +526,12 @@ void GlobalPathAnalyzer::generateCandidatePaths(double s0, double q0,
 {
     candidate_paths.clear();
     cart_candidate_paths.clear();
+
+    double future_inside_q0 = insideSignedLateralOffset(future_in_X_, future_in_Y_, future_inside_s0_);
+    double future_outside_q0 = outsideSignedLateralOffset(future_out_X_, future_out_Y_, future_outside_s0_);
+
+    ROS_INFO("future_inside_q0: %.3f", future_inside_q0);
+    ROS_INFO("future_outside_q0: %.3f", future_outside_q0);
 
     // sub_q: 두 전역 경로 간 q 차이 (멤버 변수)
     if (sub_q_ <= 0.3) {
